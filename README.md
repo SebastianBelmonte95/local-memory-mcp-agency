@@ -117,7 +117,7 @@ graph LR
 
 ### Agency-Agents Tools (Primary)
 
-These tools are compatible with the [Agency-Agents](https://github.com/cunicopia-dev/agency-agents) multi-agent workflow system.
+These tools are compatible with the [Agency-Agents](https://github.com/msitarzewski/agency-agents) multi-agent workflow system.
 
 #### `remember`
 Store decisions, deliverables, and context with tags for organized recall.
@@ -328,7 +328,7 @@ graph TB
 ```
 ## Agency-Agents Integration
 
-This server is compatible with the [Agency-Agents](https://github.com/cunicopia-dev/agency-agents) multi-agent workflow system. It provides the four tools that agency-agents expects: `remember`, `recall`, `rollback`, and `search`.
+This server is compatible with the [Agency-Agents](https://github.com/msitarzewski/agency-agents) multi-agent workflow system. It provides the four tools that agency-agents expects: `remember`, `recall`, `rollback`, and `search`.
 
 ### MCP Client Configuration
 
@@ -368,7 +368,7 @@ claude mcp add --transport stdio memory-server -- python3 src/postgres_memory_se
 
 ### Workflow Pattern
 
-Once configured, add a **Memory Integration** section to any agent prompt (see [agency-agents integration docs](https://github.com/cunicopia-dev/agency-agents/tree/main/integrations/mcp-memory)):
+Once configured, add a **Memory Integration** section to any agent prompt (see [agency-agents integration docs](https://github.com/msitarzewski/agency-agents/tree/main/integrations/mcp-memory)):
 
 ```
 When you start a session:
