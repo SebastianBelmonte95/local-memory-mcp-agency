@@ -811,3 +811,127 @@ class TestCheckpointAutoCleanup:
         cursor.execute("SELECT COUNT(*) FROM checkpoints")
         assert cursor.fetchone()[0] == 2
         conn.close()
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestExportMemories:
+    def test_export_contains_all_tables(self, sqlite_memory_api):
+        api = sqlite_memory_api
+        mem_id = api.store_memory("test content", tags=["a"])
+        api.update_memory(mem_id, content="updated")
+        api.create_checkpoint("save")
+        export = api.export_memories()
+        assert export["version"] == 1
+        assert export["source_backend"] == "sqlite"
+        assert len(export["memories"]) == 1
+        assert len(export["memory_versions"]) == 1
+        assert len(export["checkpoints"]) == 1
+        assert export["memories"][0]["tags"] == ["a"]
+        assert export["memories"][0]["content"] == "updated"
+
+    def test_export_empty_db(self, sqlite_memory_api):
+        export = sqlite_memory_api.export_memories()
+        assert export["memories"] == []
+        assert export["memory_versions"] == []
+        assert export["checkpoints"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestImportMemories:
+    def test_round_trip(self, tmp_path):
+        """Export from one instance, import to another — data matches."""
+        api1 = SQLiteMemoryAPI(db_path=str(tmp_path / "src.db"))
+        api1.store_memory("memory one", tags=["project-x"])
+        time.sleep(0.002)
+        api1.store_memory("memory two", tags=["project-y"])
+        api1.create_checkpoint("save")
+        export = api1.export_memories()
+
+        api2 = SQLiteMemoryAPI(db_path=str(tmp_path / "dst.db"))
+        counts = api2.import_memories(export)
+        assert counts["memories"] == 2
+        assert counts["checkpoints"] == 1
+
+        # Verify data is searchable
+        results = api2.retrieve_memories("", tags=["project-x"])
+        assert len(results) == 1
+        assert results[0]["content"] == "memory one"
+
+    def test_round_trip_with_versions(self, tmp_path):
+        """Export including version history, import to new instance."""
+        api1 = SQLiteMemoryAPI(db_path=str(tmp_path / "src2.db"))
+        mem_id = api1.store_memory("v1", tags=["a"])
+        time.sleep(0.002)
+        api1.update_memory(mem_id, content="v2")
+        api1.create_checkpoint("save")
+        export = api1.export_memories()
+        assert len(export["memory_versions"]) == 1
+
+        api2 = SQLiteMemoryAPI(db_path=str(tmp_path / "dst2.db"))
+        counts = api2.import_memories(export)
+        assert counts["memories"] == 1
+        assert counts["memory_versions"] == 1
+        assert counts["checkpoints"] == 1
+
+        # Verify version history works — rollback should restore v1
+        api2.rollback_memory(mem_id)
+        conn = sqlite3.connect(api2.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT content FROM memories WHERE id = ?", (mem_id,))
+        assert cursor.fetchone()[0] == "v1"
+        conn.close()
+
+    def test_skips_duplicate_versions_and_checkpoints(self, tmp_path):
+        """Re-importing versions and checkpoints that already exist should skip them."""
+        api = SQLiteMemoryAPI(db_path=str(tmp_path / "dup.db"))
+        mem_id = api.store_memory("content")
+        time.sleep(0.002)
+        api.update_memory(mem_id, content="v2")
+        api.create_checkpoint("save")
+        export = api.export_memories()
+
+        # Re-import — everything should be skipped
+        counts = api.import_memories(export)
+        assert counts["memories"] == 0
+        assert counts["memory_versions"] == 0
+        assert counts["checkpoints"] == 0
+
+    def test_skips_duplicates(self, sqlite_memory_api):
+        api = sqlite_memory_api
+        api.store_memory("original")
+        export = api.export_memories()
+        # Import the same data again
+        counts = api.import_memories(export)
+        assert counts["memories"] == 0
+        assert counts["checkpoints"] == 0
+
+    def test_import_empty(self, sqlite_memory_api):
+        counts = sqlite_memory_api.import_memories({"memories": [], "memory_versions": [], "checkpoints": []})
+        assert counts == {"memories": 0, "memory_versions": 0, "checkpoints": 0}
+
+    def test_import_regenerates_embeddings(self, tmp_path):
+        mock_vs = MagicMock()
+        api = SQLiteMemoryAPI(db_path=str(tmp_path / "t.db"), vector_store=mock_vs)
+        data = {
+            "memories": [{"id": "mem_1", "content": "test", "tags": [], "metadata": {},
+                          "created_at": 1.0, "updated_at": 1.0, "expires_at": None}],
+            "memory_versions": [],
+            "checkpoints": [],
+        }
+        api.import_memories(data)
+        mock_vs.add_text.assert_called_once()
+
+    def test_import_vector_store_error_silent(self, tmp_path):
+        mock_vs = MagicMock()
+        mock_vs.add_text.side_effect = RuntimeError("broken")
+        api = SQLiteMemoryAPI(db_path=str(tmp_path / "t.db"), vector_store=mock_vs)
+        data = {
+            "memories": [{"id": "mem_1", "content": "test", "tags": [], "metadata": {},
+                          "created_at": 1.0, "updated_at": 1.0, "expires_at": None}],
+            "memory_versions": [],
+            "checkpoints": [],
+        }
+        counts = api.import_memories(data)
+        assert counts["memories"] == 1

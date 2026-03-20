@@ -209,3 +209,57 @@ requiring manual cleanup.
 - [x] **7.5.4** 100% coverage maintained (263 tests, 973 statements, 0 misses)
 - [x] **7.5.5** CLAUDE.md: lifecycle management section with decision guide
 - [x] **7.5.6** README.md: new env vars, tools, Memory Lifecycle section with examples
+
+---
+
+## Phase 8: Memory Export/Import (portability)
+
+**Problem:** Memories are locked to the database instance they were created on. When migrating
+from local development to a web server, or moving between devices, there's no way to take your
+memories with you.
+
+**Solution:** JSON-based export/import that works across backends. Export from SQLite, import
+to PostgreSQL (or vice versa). The export file contains everything: memories, version history,
+and checkpoints — a complete snapshot of the memory state.
+
+**Export format:**
+```json
+{
+  "version": 1,
+  "exported_at": "2026-03-19T...",
+  "source_backend": "sqlite",
+  "memories": [...],
+  "memory_versions": [...],
+  "checkpoints": [...]
+}
+```
+
+Embeddings are excluded from export (they're large and backend-specific). The target instance
+regenerates them via Ollama on import if available.
+
+### Phase 8.1: API Layer — DONE
+
+- [x] **8.1.1** `SQLiteMemoryAPI.export_memories()` — all tables, embeddings excluded
+- [x] **8.1.2** `SQLiteMemoryAPI.import_memories()` — skips duplicates, regenerates embeddings
+- [x] **8.1.3** `PostgresMemoryAPI.export_memories(domain?)` — domain-scoped
+- [x] **8.1.4** `PostgresMemoryAPI.import_memories(data, domain?)` — domain-aware, embedding regen
+
+### Phase 8.2: MCP Tool Layer — DONE
+
+- [x] **8.2.1** `export_memories` tool on both servers
+- [x] **8.2.2** `import_memories` tool on both servers
+
+### Phase 8.3: Tests — DONE
+
+- [x] **8.3.1** SQLite export: all tables included, embeddings excluded
+- [x] **8.3.2** SQLite import: round-trip with versions (export → import → rollback works)
+- [x] **8.3.3** SQLite import: duplicates skipped (memories, versions, checkpoints)
+- [x] **8.3.4** PostgreSQL export/import with mocked psycopg2, duplicate skipping, embedding regen
+- [x] **8.3.5** MCP tool tests for both servers
+- [x] **8.3.6** Integration test: export from one SQLite instance, import to another, verify data
+- [x] **8.3.7** 100% coverage maintained (285 tests, 1100 statements, 0 misses)
+
+### Phase 8.4: Documentation — DONE
+
+- [x] **8.4.1** CLAUDE.md updated with export/import tools
+- [x] **8.4.2** README.md updated with Migration Guide (local → server workflow)

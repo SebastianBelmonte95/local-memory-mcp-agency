@@ -267,6 +267,41 @@ def search(query: str, domain: Optional[str] = None,
     return results
 
 
+@mcp.tool
+def export_memories(domain: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Export all memories, version history, and checkpoints as portable JSON.
+
+    Use this to back up your memory state or migrate to another device/server.
+    Embeddings are excluded (regenerated on import).
+
+    Parameters:
+    - domain (str, optional): Domain to export (default: 'default').
+
+    Returns:
+    Dict: Complete memory export including memories, versions, and checkpoints.
+    """
+    return memory_api.export_memories(domain)
+
+
+@mcp.tool
+def import_memories(data: Dict[str, Any], domain: Optional[str] = None) -> Dict[str, int]:
+    """
+    Import memories from a previously exported JSON snapshot.
+
+    Skips duplicates (by ID) so re-importing is safe. Embeddings are regenerated
+    if Ollama is available.
+
+    Parameters:
+    - data (Dict): The export dict from export_memories.
+    - domain (str, optional): Domain to import into (default: 'default').
+
+    Returns:
+    Dict: Counts of imported items {"memories": N, "memory_versions": N, "checkpoints": N}.
+    """
+    return memory_api.import_memories(data, domain)
+
+
 # ── Legacy tools (backward compatibility) ───────────────────────────────────
 
 @mcp.tool

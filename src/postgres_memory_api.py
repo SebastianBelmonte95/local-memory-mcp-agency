@@ -600,6 +600,119 @@ class PostgresMemoryAPI:
                 cursor.execute(query)
                 return [dict(row) for row in cursor.fetchall()]
 
+    def export_memories(self, domain: str = None) -> Dict[str, Any]:
+        """Export all memories, versions, and checkpoints for a domain as a portable dict."""
+        domain = domain or self.default_domain
+        self._ensure_table_exists(domain)
+
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                table_name = sql.Identifier(f"{domain}_memories")
+                versions_table = sql.Identifier(f"{domain}_memory_versions")
+                checkpoints_table = sql.Identifier(f"{domain}_checkpoints")
+
+                # Export memories (exclude embedding — not portable)
+                cursor.execute(sql.SQL(
+                    "SELECT id, content, tags, metadata, created_at, updated_at, expires_at FROM {}"
+                ).format(table_name))
+                memories = [dict(row) for row in cursor.fetchall()]
+
+                # Export versions (exclude embedding)
+                cursor.execute(sql.SQL(
+                    "SELECT version_id, memory_id, content, tags, metadata, created_at FROM {}"
+                ).format(versions_table))
+                versions = [dict(row) for row in cursor.fetchall()]
+
+                # Export checkpoints
+                cursor.execute(sql.SQL(
+                    "SELECT id, name, tags, created_at FROM {}"
+                ).format(checkpoints_table))
+                checkpoints = [dict(row) for row in cursor.fetchall()]
+
+        # Serialize timestamps and other non-JSON types
+        for mem in memories:
+            mem["created_at"] = str(mem["created_at"])
+            mem["updated_at"] = str(mem["updated_at"])
+            mem["expires_at"] = str(mem["expires_at"]) if mem.get("expires_at") else None
+        for ver in versions:
+            ver["created_at"] = str(ver["created_at"])
+        for chk in checkpoints:
+            chk["created_at"] = str(chk["created_at"])
+
+        return {
+            "version": 1,
+            "exported_at": str(time.time()),
+            "source_backend": "postgresql",
+            "domain": domain,
+            "memories": memories,
+            "memory_versions": versions,
+            "checkpoints": checkpoints,
+        }
+
+    def import_memories(self, data: Dict[str, Any], domain: str = None) -> Dict[str, int]:
+        """Import memories from an export dict. Skips duplicates by ID."""
+        domain = domain or self.default_domain
+        self._ensure_table_exists(domain)
+        counts = {"memories": 0, "memory_versions": 0, "checkpoints": 0}
+
+        with self._get_connection() as conn:
+            with conn.cursor() as cursor:
+                table_name = sql.Identifier(f"{domain}_memories")
+                versions_table = sql.Identifier(f"{domain}_memory_versions")
+                checkpoints_table = sql.Identifier(f"{domain}_checkpoints")
+
+                for mem in data.get("memories", []):
+                    # Skip if already exists
+                    cursor.execute(sql.SQL("SELECT 1 FROM {} WHERE id = %s").format(table_name), (mem["id"],))
+                    if cursor.fetchone():
+                        continue
+
+                    tags = mem.get("tags", [])
+                    metadata = mem.get("metadata", {})
+
+                    # Regenerate embedding if available
+                    embedding = None
+                    if self.ollama_embeddings:
+                        try:
+                            embedding = self.ollama_embeddings.get_embedding(mem["content"])
+                        except Exception:
+                            pass
+
+                    if embedding:
+                        cursor.execute(sql.SQL("""
+                            INSERT INTO {} (id, content, embedding, tags, metadata)
+                            VALUES (%s, %s, %s::vector, %s, %s)
+                        """).format(table_name), (mem["id"], mem["content"], embedding, tags, Json(metadata)))
+                    else:
+                        cursor.execute(sql.SQL("""
+                            INSERT INTO {} (id, content, tags, metadata)
+                            VALUES (%s, %s, %s, %s)
+                        """).format(table_name), (mem["id"], mem["content"], tags, Json(metadata)))
+                    counts["memories"] += 1
+
+                for ver in data.get("memory_versions", []):
+                    tags = ver.get("tags", [])
+                    metadata = ver.get("metadata", {})
+                    cursor.execute(sql.SQL("""
+                        INSERT INTO {} (memory_id, content, tags, metadata)
+                        VALUES (%s, %s, %s, %s)
+                    """).format(versions_table), (ver["memory_id"], ver["content"], tags, Json(metadata)))
+                    counts["memory_versions"] += 1
+
+                for chk in data.get("checkpoints", []):
+                    cursor.execute(sql.SQL("SELECT 1 FROM {} WHERE id = %s").format(checkpoints_table), (chk["id"],))
+                    if cursor.fetchone():
+                        continue
+                    tags = chk.get("tags", [])
+                    cursor.execute(sql.SQL("""
+                        INSERT INTO {} (id, name, tags)
+                        VALUES (%s, %s, %s)
+                    """).format(checkpoints_table), (chk["id"], chk["name"], tags))
+                    counts["checkpoints"] += 1
+
+                conn.commit()
+        return counts
+
     def list_domains(self) -> List[str]:
         """List all available memory domains."""
         with self._get_connection() as conn:

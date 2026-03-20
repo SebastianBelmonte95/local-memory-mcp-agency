@@ -176,6 +176,19 @@ Compress old memories matching tags into LLM-generated summaries.
 - **Use case**: Project milestone reached, compress 50 sprint notes into 3 summaries
 - **Warning**: Lossy compression — granular details (URLs, error codes) may not survive
 
+#### `export_memories`
+Export all memories, version history, and checkpoints as portable JSON.
+- `export_memories(domain?)`
+- Embeddings excluded (regenerated on import)
+- **Use case**: Back up memory state, migrate local → server, move between devices
+
+#### `import_memories`
+Import memories from a previously exported JSON snapshot.
+- `import_memories(data, domain?)`
+- Skips duplicates by ID (safe to re-import)
+- Regenerates embeddings via Ollama if available
+- Works cross-backend (export from SQLite, import to PostgreSQL)
+
 #### `search`
 Find specific memories across sessions and agents using semantic or text search.
 - `search(query, domain?, limit?, use_vector?)`
@@ -596,6 +609,29 @@ list_memory_domains()  // Returns: ["default", "startup", "health"]
 - `POSTGRES_USER`: Database user (default: `postgres`)
 - `POSTGRES_PASSWORD`: Database password (required)
 - `DEFAULT_MEMORY_DOMAIN`: Default domain for memories (default: `default`)
+
+## Migration Guide (local → server)
+
+To move your memories from a local instance to a remote server (or between devices):
+
+**1. Export from your current instance:**
+```javascript
+export_memories()  // SQLite
+export_memories("startup")  // PostgreSQL, specific domain
+```
+Save the returned JSON to a file.
+
+**2. Set up the target instance** with PostgreSQL on your server (see [Claude Desktop Setup](#claude-desktop-setup)).
+
+**3. Import on the target:**
+```javascript
+import_memories(data)  // pass the exported JSON
+import_memories(data, "startup")  // PostgreSQL, specific domain
+```
+
+Embeddings are regenerated automatically if Ollama is available on the target. Duplicate IDs are skipped, so re-importing is safe.
+
+This works across backends — export from SQLite locally, import to PostgreSQL on your server.
 
 ## Memory Lifecycle
 

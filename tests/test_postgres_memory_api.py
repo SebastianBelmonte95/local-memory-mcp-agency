@@ -532,6 +532,86 @@ class TestCheckpointAutoCleanup:
 
 @pytest.mark.unit
 @pytest.mark.postgres
+class TestExportMemories:
+    def test_export_returns_dict(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchall.return_value = [
+            {"id": "mem_1", "content": "test", "tags": ["a"], "metadata": {},
+             "created_at": "2026-01-01", "updated_at": "2026-01-01", "expires_at": None}
+        ]
+        export = pg_api.export_memories()
+        assert export["version"] == 1
+        assert export["source_backend"] == "postgresql"
+        assert len(export["memories"]) >= 1
+
+    def test_export_with_domain(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchall.return_value = []
+        pg_api.export_memories(domain="health")
+        assert mock_pg_cursor.execute.called
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestImportMemories:
+    def test_import_memories(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchone.return_value = None  # no duplicates
+        data = {
+            "memories": [{"id": "mem_1", "content": "test", "tags": ["a"], "metadata": {},
+                          "created_at": 1.0, "updated_at": 1.0}],
+            "memory_versions": [{"version_id": 1, "memory_id": "mem_1", "content": "old",
+                                  "tags": [], "metadata": {}, "created_at": 1.0}],
+            "checkpoints": [{"id": "chk_1", "name": "save", "tags": [], "created_at": 1.0}],
+        }
+        counts = pg_api.import_memories(data)
+        assert counts["memories"] == 1
+        assert counts["memory_versions"] == 1
+        assert counts["checkpoints"] == 1
+
+    def test_import_skips_duplicate_memory(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchone.return_value = (1,)  # already exists
+        data = {
+            "memories": [{"id": "mem_1", "content": "test", "tags": [], "metadata": {}}],
+            "memory_versions": [],
+            "checkpoints": [],
+        }
+        counts = pg_api.import_memories(data)
+        assert counts["memories"] == 0
+
+    def test_import_with_embeddings(self, pg_api_with_embeddings, mock_pg_cursor):
+        mock_pg_cursor.fetchone.return_value = None
+        data = {
+            "memories": [{"id": "mem_1", "content": "test", "tags": [], "metadata": {}}],
+            "memory_versions": [],
+            "checkpoints": [],
+        }
+        counts = pg_api_with_embeddings.import_memories(data)
+        assert counts["memories"] == 1
+        pg_api_with_embeddings.ollama_embeddings.get_embedding.assert_called()
+
+    def test_import_skips_duplicate_checkpoint(self, pg_api, mock_pg_cursor):
+        # fetchone returns (1,) for the checkpoint existence check
+        mock_pg_cursor.fetchone.return_value = (1,)
+        data = {
+            "memories": [],
+            "memory_versions": [],
+            "checkpoints": [{"id": "chk_1", "name": "save", "tags": [], "created_at": 1.0}],
+        }
+        counts = pg_api.import_memories(data)
+        assert counts["checkpoints"] == 0
+
+    def test_import_embedding_failure_silent(self, pg_api_with_embeddings, mock_pg_cursor):
+        mock_pg_cursor.fetchone.return_value = None
+        pg_api_with_embeddings.ollama_embeddings.get_embedding.side_effect = RuntimeError("fail")
+        data = {
+            "memories": [{"id": "mem_1", "content": "test", "tags": [], "metadata": {}}],
+            "memory_versions": [],
+            "checkpoints": [],
+        }
+        counts = pg_api_with_embeddings.import_memories(data)
+        assert counts["memories"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
 class TestEnsureTableExists:
     def test_calls_create_function(self, pg_api, mock_pg_cursor):
         pg_api._ensure_table_exists("testdomain")
