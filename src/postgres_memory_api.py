@@ -362,6 +362,109 @@ class PostgresMemoryAPI:
                 conn.commit()
                 return True
 
+    def create_checkpoint(self, name: str, domain: str = None,
+                          tags: List[str] = None) -> str:
+        """Create a named checkpoint for atomic multi-memory rollback."""
+        domain = domain or self.default_domain
+        self._ensure_table_exists(domain)
+
+        checkpoint_id = f"chk_{int(time.time() * 1000)}"
+        tags = tags or []
+
+        with self._get_connection() as conn:
+            with conn.cursor() as cursor:
+                checkpoints_table = sql.Identifier(f"{domain}_checkpoints")
+                query = sql.SQL("""
+                    INSERT INTO {} (id, name, tags, created_at)
+                    VALUES (%s, %s, %s, NOW())
+                """).format(checkpoints_table)
+                cursor.execute(query, (checkpoint_id, name, tags))
+                conn.commit()
+
+        return checkpoint_id
+
+    def rollback_to_checkpoint(self, checkpoint_id: str, domain: str = None) -> bool:
+        """Atomically rollback to a checkpoint: delete new memories, restore updated ones."""
+        domain = domain or self.default_domain
+
+        with self._get_connection() as conn:
+            with conn.cursor() as cursor:
+                table_name = sql.Identifier(f"{domain}_memories")
+                versions_table = sql.Identifier(f"{domain}_memory_versions")
+                checkpoints_table = sql.Identifier(f"{domain}_checkpoints")
+
+                # Get checkpoint timestamp
+                chk_query = sql.SQL(
+                    "SELECT created_at FROM {} WHERE id = %s"
+                ).format(checkpoints_table)
+                cursor.execute(chk_query, (checkpoint_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                checkpoint_time = row[0]
+
+                # Step 1: Delete memories created after the checkpoint
+                delete_query = sql.SQL(
+                    "DELETE FROM {} WHERE created_at > %s"
+                ).format(table_name)
+                cursor.execute(delete_query, (checkpoint_time,))
+
+                # Step 2: Restore memories updated after the checkpoint
+                # Find oldest version snapshot after checkpoint for each memory
+                restore_query = sql.SQL("""
+                    SELECT DISTINCT ON (mv.memory_id)
+                        mv.memory_id, mv.content, mv.tags, mv.metadata, mv.embedding
+                    FROM {} mv
+                    WHERE mv.created_at > %s
+                    ORDER BY mv.memory_id, mv.version_id ASC
+                """).format(versions_table)
+                cursor.execute(restore_query, (checkpoint_time,))
+                versions_to_restore = cursor.fetchall()
+
+                for mem_id, content, tags, metadata, embedding in versions_to_restore:
+                    if embedding:
+                        upd = sql.SQL("""
+                            UPDATE {} SET content = %s, embedding = %s,
+                            tags = %s, metadata = %s, updated_at = NOW()
+                            WHERE id = %s
+                        """).format(table_name)
+                        cursor.execute(upd, (content, embedding, tags, metadata, mem_id))
+                    else:
+                        upd = sql.SQL("""
+                            UPDATE {} SET content = %s, tags = %s, metadata = %s,
+                            updated_at = NOW() WHERE id = %s
+                        """).format(table_name)
+                        cursor.execute(upd, (content, tags, metadata, mem_id))
+
+                # Step 3: Delete version entries created after checkpoint
+                del_versions = sql.SQL(
+                    "DELETE FROM {} WHERE created_at > %s"
+                ).format(versions_table)
+                cursor.execute(del_versions, (checkpoint_time,))
+
+                # Step 4: Delete the checkpoint and any created after it
+                del_checkpoints = sql.SQL(
+                    "DELETE FROM {} WHERE created_at >= %s"
+                ).format(checkpoints_table)
+                cursor.execute(del_checkpoints, (checkpoint_time,))
+
+                conn.commit()
+                return True
+
+    def list_checkpoints(self, domain: str = None) -> List[Dict[str, Any]]:
+        """List all checkpoints for a domain, newest first."""
+        domain = domain or self.default_domain
+        self._ensure_table_exists(domain)
+
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+                checkpoints_table = sql.Identifier(f"{domain}_checkpoints")
+                query = sql.SQL(
+                    "SELECT id, name, tags, created_at FROM {} ORDER BY created_at DESC"
+                ).format(checkpoints_table)
+                cursor.execute(query)
+                return [dict(row) for row in cursor.fetchall()]
+
     def list_domains(self) -> List[str]:
         """List all available memory domains."""
         with self._get_connection() as conn:

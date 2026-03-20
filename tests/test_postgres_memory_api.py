@@ -370,6 +370,83 @@ class TestRetrieveEdgeCases:
 
 @pytest.mark.unit
 @pytest.mark.postgres
+class TestCreateCheckpoint:
+    def test_returns_id(self, pg_api, mock_pg_cursor):
+        chk_id = pg_api.create_checkpoint("save point")
+        assert chk_id.startswith("chk_")
+        assert mock_pg_cursor.execute.called
+
+    def test_with_tags_and_domain(self, pg_api, mock_pg_cursor):
+        chk_id = pg_api.create_checkpoint("save", domain="health", tags=["a"])
+        assert chk_id.startswith("chk_")
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestRollbackToCheckpoint:
+    def test_success_deletes_new_and_restores_updated(self, pg_api, mock_pg_cursor):
+        # fetchone: checkpoint exists with timestamp
+        mock_pg_cursor.fetchone.return_value = ("2026-01-01T00:00:00Z",)
+        # fetchall: versions to restore
+        mock_pg_cursor.fetchall.return_value = [
+            ("mem_old", "restored content", ["tag"], '{"k":"v"}', None)
+        ]
+        result = pg_api.rollback_to_checkpoint("chk_123")
+        assert result is True
+        # Should have multiple execute calls: get checkpoint, delete new memories,
+        # select versions, restore, delete versions, delete checkpoints
+        assert mock_pg_cursor.execute.call_count >= 5
+
+    def test_restores_with_embedding(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchone.return_value = ("2026-01-01T00:00:00Z",)
+        mock_pg_cursor.fetchall.return_value = [
+            ("mem_old", "content", ["tag"], '{"k":"v"}', [0.1] * 768)
+        ]
+        result = pg_api.rollback_to_checkpoint("chk_123")
+        assert result is True
+
+    def test_checkpoint_not_found(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchone.return_value = None
+        result = pg_api.rollback_to_checkpoint("chk_nonexistent")
+        assert result is False
+
+    def test_no_changes_to_restore(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchone.return_value = ("2026-01-01T00:00:00Z",)
+        mock_pg_cursor.fetchall.return_value = []  # no versions to restore
+        result = pg_api.rollback_to_checkpoint("chk_123")
+        assert result is True  # still succeeds (just deletes new memories + cleans up)
+
+    def test_with_domain(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchone.return_value = ("2026-01-01T00:00:00Z",)
+        mock_pg_cursor.fetchall.return_value = []
+        result = pg_api.rollback_to_checkpoint("chk_123", domain="health")
+        assert result is True
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestListCheckpoints:
+    def test_returns_checkpoints(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchall.return_value = [
+            {"id": "chk_2", "name": "save2", "tags": [], "created_at": "2026-01-02T00:00:00Z"},
+            {"id": "chk_1", "name": "save1", "tags": ["a"], "created_at": "2026-01-01T00:00:00Z"},
+        ]
+        result = pg_api.list_checkpoints()
+        assert len(result) == 2
+        assert result[0]["id"] == "chk_2"
+
+    def test_empty(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchall.return_value = []
+        assert pg_api.list_checkpoints() == []
+
+    def test_with_domain(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchall.return_value = []
+        pg_api.list_checkpoints(domain="health")
+        assert mock_pg_cursor.execute.called
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
 class TestEnsureTableExists:
     def test_calls_create_function(self, pg_api, mock_pg_cursor):
         pg_api._ensure_table_exists("testdomain")

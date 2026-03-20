@@ -66,8 +66,11 @@ Key design decisions:
 **Agency-Agents compatible tools** (primary interface):
 - `remember(content, tags?, source?, importance?, domain?)` — store decisions/deliverables with tags
 - `recall(tags?, query?, domain?, limit?)` — retrieve by tag filter and/or semantic search
-- `rollback(memory_id, domain?)` — revert a memory to its previous version
+- `checkpoint(name, tags?, domain?)` — create a named save point before risky work
+- `rollback(checkpoint_id, domain?)` — atomically undo all changes made after a checkpoint (deletes new memories, restores updated ones)
+- `rollback_memory(memory_id, domain?)` — revert a single memory to its previous version (per-memory, stack-based)
 - `search(query, domain?, limit?)` — broad semantic/text search across all memories
+- `list_checkpoints(domain?)` — list available checkpoints
 
 **Legacy tools** (kept for backward compatibility):
 - `store_memory`, `update_memory`, `search_memories`
@@ -76,7 +79,7 @@ Both versions also expose: `summarize_memories` prompt, `memory://` resource URI
 
 **Tags** are the primary organizational mechanism — use agent name, project name, and topic (e.g., `["backend-architect", "retroboard", "api-spec"]`). `recall` filters by ALL provided tags (AND logic).
 
-**Rollback** works via version history: every `update_memory` call snapshots the current state before overwriting. Rollback restores the most recent snapshot and consumes it (stack behavior).
+**Checkpoints** enable atomic multi-memory rollback. `checkpoint()` creates a named save point; `rollback()` undoes everything after it — deleting new memories and restoring updated ones. For single-memory rollback, use `rollback_memory()` which pops one version from the history stack.
 
 ## Configuration
 

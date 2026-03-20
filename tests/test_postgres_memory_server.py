@@ -8,7 +8,9 @@ with patch("requests.get", side_effect=ConnectionError("mocked")), \
      patch("postgres_memory_api.psycopg2"):
     import postgres_memory_server
     from postgres_memory_server import (
-        remember, recall, rollback, search,
+        checkpoint, remember, recall, rollback,
+        rollback_memory as rollback_memory_tool,
+        search, list_checkpoints,
         store_memory, update_memory, search_memories,
         get_memories, list_memory_domains, summarize_memories,
     )
@@ -78,20 +80,70 @@ class TestRecallTool:
 
 @pytest.mark.unit
 @pytest.mark.postgres
+class TestCheckpointTool:
+    def test_basic(self, mock_api):
+        mock_api.create_checkpoint.return_value = "chk_123"
+        result = checkpoint("before-redesign")
+        assert result == "chk_123"
+        mock_api.create_checkpoint.assert_called_once_with("before-redesign", None, tags=None)
+
+    def test_with_tags_and_domain(self, mock_api):
+        mock_api.create_checkpoint.return_value = "chk_456"
+        checkpoint("save", tags=["a"], domain="health")
+        mock_api.create_checkpoint.assert_called_once_with("save", "health", tags=["a"])
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
 class TestRollbackTool:
     def test_success(self, mock_api):
+        mock_api.rollback_to_checkpoint.return_value = True
+        assert rollback("chk_123") is True
+        mock_api.rollback_to_checkpoint.assert_called_once_with("chk_123", None)
+
+    def test_with_domain(self, mock_api):
+        mock_api.rollback_to_checkpoint.return_value = True
+        rollback("chk_123", domain="health")
+        mock_api.rollback_to_checkpoint.assert_called_once_with("chk_123", "health")
+
+    def test_not_found(self, mock_api):
+        mock_api.rollback_to_checkpoint.return_value = False
+        assert rollback("chk_nonexistent") is False
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestRollbackMemoryTool:
+    def test_success(self, mock_api):
         mock_api.rollback_memory.return_value = True
-        assert rollback("mem_1") is True
+        assert rollback_memory_tool("mem_1") is True
         mock_api.rollback_memory.assert_called_once_with("mem_1", None)
 
     def test_with_domain(self, mock_api):
         mock_api.rollback_memory.return_value = True
-        rollback("mem_1", domain="health")
+        rollback_memory_tool("mem_1", domain="health")
         mock_api.rollback_memory.assert_called_once_with("mem_1", "health")
 
     def test_not_found(self, mock_api):
         mock_api.rollback_memory.return_value = False
-        assert rollback("mem_nonexistent") is False
+        assert rollback_memory_tool("mem_nonexistent") is False
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestListCheckpointsTool:
+    def test_returns_checkpoints(self, mock_api):
+        mock_api.list_checkpoints.return_value = [
+            {"id": "chk_1", "name": "save1", "tags": [], "created_at": "2026-01-01T00:00:00Z"}
+        ]
+        result = list_checkpoints()
+        assert len(result) == 1
+        mock_api.list_checkpoints.assert_called_once_with(None)
+
+    def test_with_domain(self, mock_api):
+        mock_api.list_checkpoints.return_value = []
+        list_checkpoints(domain="health")
+        mock_api.list_checkpoints.assert_called_once_with("health")
 
 
 @pytest.mark.unit

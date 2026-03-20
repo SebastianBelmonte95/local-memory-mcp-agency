@@ -81,6 +81,54 @@ class TestRollbackIntegration:
 
 @pytest.mark.integration
 @pytest.mark.sqlite
+class TestCheckpointIntegration:
+    def test_full_agency_agents_scenario(self, sqlite_memory_api_with_vectors):
+        """Create checkpoint → remember 3 → update 2 existing → rollback → verify."""
+        api = sqlite_memory_api_with_vectors
+        # Pre-existing memories
+        existing_1 = api.store_memory("existing api spec v1", tags=["backend-architect"])
+        existing_2 = api.store_memory("existing db schema v1", tags=["backend-architect"])
+        time.sleep(0.01)
+
+        # Create checkpoint
+        chk_id = api.create_checkpoint("before-redesign", tags=["backend-architect"])
+        time.sleep(0.01)
+
+        # Agent creates 3 new memories
+        new_1 = api.store_memory("new api spec v2", tags=["backend-architect"])
+        time.sleep(0.002)
+        new_2 = api.store_memory("new auth strategy", tags=["backend-architect"])
+        time.sleep(0.002)
+        new_3 = api.store_memory("new caching layer", tags=["backend-architect"])
+        time.sleep(0.002)
+
+        # Agent updates 2 existing memories
+        api.update_memory(existing_1, content="existing api spec v2 BROKEN")
+        api.update_memory(existing_2, content="existing db schema v2 BROKEN")
+
+        # QA fails — rollback to checkpoint
+        result = api.rollback_to_checkpoint(chk_id)
+        assert result is True
+
+        # Verify: 3 new memories gone
+        all_results = api.retrieve_memories("", tags=["backend-architect"], limit=100)
+        all_ids = [r["id"] for r in all_results]
+        assert new_1 not in all_ids
+        assert new_2 not in all_ids
+        assert new_3 not in all_ids
+
+        # Verify: 2 existing memories restored
+        assert existing_1 in all_ids
+        assert existing_2 in all_ids
+        for r in all_results:
+            if r["id"] == existing_1:
+                assert r["content"] == "existing api spec v1"
+            if r["id"] == existing_2:
+                assert r["content"] == "existing db schema v1"
+
+
+@pytest.mark.integration
+@pytest.mark.sqlite
 class TestGracefulDegradation:
     def test_broken_vector_store_falls_back(self, tmp_path, mock_ollama_embeddings):
         from unittest.mock import patch

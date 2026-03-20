@@ -8,7 +8,8 @@ from unittest.mock import patch, MagicMock
 with patch("requests.get", side_effect=ConnectionError("mocked")):
     import sqlite_memory_server
     from sqlite_memory_server import (
-        remember, recall, rollback, search,
+        checkpoint, remember, recall, rollback, rollback_memory as rollback_memory_tool,
+        search, list_checkpoints,
         store_memory, update_memory, search_memories,
         get_memories, summarize_memories,
     )
@@ -78,15 +79,61 @@ class TestRecallTool:
 
 @pytest.mark.unit
 @pytest.mark.sqlite
+class TestCheckpointTool:
+    def test_basic(self, mock_api):
+        mock_api.create_checkpoint.return_value = "chk_123"
+        result = checkpoint("before-redesign")
+        assert result == "chk_123"
+        mock_api.create_checkpoint.assert_called_once_with("before-redesign", tags=None)
+
+    def test_with_tags(self, mock_api):
+        mock_api.create_checkpoint.return_value = "chk_456"
+        checkpoint("save point", tags=["agent-a", "project-x"])
+        mock_api.create_checkpoint.assert_called_once_with(
+            "save point", tags=["agent-a", "project-x"]
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
 class TestRollbackTool:
     def test_success(self, mock_api):
+        mock_api.rollback_to_checkpoint.return_value = True
+        assert rollback("chk_123") is True
+        mock_api.rollback_to_checkpoint.assert_called_once_with("chk_123")
+
+    def test_not_found(self, mock_api):
+        mock_api.rollback_to_checkpoint.return_value = False
+        assert rollback("chk_nonexistent") is False
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestRollbackMemoryTool:
+    def test_success(self, mock_api):
         mock_api.rollback_memory.return_value = True
-        assert rollback("mem_1") is True
+        assert rollback_memory_tool("mem_1") is True
         mock_api.rollback_memory.assert_called_once_with("mem_1")
 
     def test_not_found(self, mock_api):
         mock_api.rollback_memory.return_value = False
-        assert rollback("mem_nonexistent") is False
+        assert rollback_memory_tool("mem_nonexistent") is False
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestListCheckpointsTool:
+    def test_returns_checkpoints(self, mock_api):
+        mock_api.list_checkpoints.return_value = [
+            {"id": "chk_1", "name": "save1", "tags": [], "created_at": 1.0}
+        ]
+        result = list_checkpoints()
+        assert len(result) == 1
+        mock_api.list_checkpoints.assert_called_once()
+
+    def test_empty(self, mock_api):
+        mock_api.list_checkpoints.return_value = []
+        assert list_checkpoints() == []
 
 
 @pytest.mark.unit

@@ -139,12 +139,29 @@ Search for relevant memories by tag, keyword, or semantic similarity.
   recall(["frontend-developer"], "api spec")   // tags + semantic search
   ```
 
+#### `checkpoint`
+Create a named save point before risky work.
+- `checkpoint(name, tags?, domain?)`
+- Returns a checkpoint ID to use with `rollback`
+- **Use case**: Before a series of changes that might need to be undone atomically
+
 #### `rollback`
-Revert a memory to its previous version when something goes wrong.
-- `rollback(memory_id, domain?)`
-- Every `update_memory` call snapshots the current state — rollback restores the most recent snapshot
-- Supports multiple rollbacks (stack behavior: v3 → v2 → v1)
-- **Use case**: QA check fails, bad architecture decision, need to restore last known-good state
+Atomically revert to a checkpoint, undoing all changes made after it.
+- `rollback(checkpoint_id, domain?)`
+- Deletes memories created after the checkpoint
+- Restores memories updated after the checkpoint to their checkpoint-time state
+- **Use case**: QA check fails, bad architecture decision — roll back everything at once
+
+#### `rollback_memory`
+Revert a single memory to its previous version.
+- `rollback_memory(memory_id, domain?)`
+- Per-memory version stack (v3 → v2 → v1)
+- **Use case**: Surgical fix to one memory without affecting others
+
+#### `list_checkpoints`
+List available checkpoints for a domain.
+- `list_checkpoints(domain?)`
+- Returns checkpoints ordered newest first
 
 #### `search`
 Find specific memories across sessions and agents using semantic or text search.
@@ -363,22 +380,32 @@ When you make key decisions or complete deliverables:
 When handing off to another agent:
 - remember("deliverable content", tags=["receiving-agent-name", "project-name"])
 
+Before risky multi-step changes:
+- checkpoint("before-redesign", tags=["your-agent-name", "project-name"])
+
 When something fails:
-- rollback(memory_id) to restore last known-good state
+- rollback(checkpoint_id) to atomically undo all changes since the checkpoint
+- rollback_memory(memory_id) to surgically revert a single memory
 ```
 
 ### Multi-Agent Handoff Example
 
 ```javascript
-// Backend Architect stores API spec for Frontend Developer
-remember("REST API: GET /api/products returns Product[]",
+// Backend Architect creates a checkpoint before risky redesign
+chk = checkpoint("before-api-redesign", ["backend-architect", "retroboard"])
+
+// Backend Architect stores new deliverables
+remember("REST API v2: GET /api/products returns Product[]",
          ["backend-architect", "retroboard", "api-spec", "frontend-developer"])
+remember("New DB schema with sharding",
+         ["backend-architect", "retroboard", "db-schema"])
 
 // Frontend Developer recalls what was left for them
 recall(["frontend-developer", "retroboard"])
 
-// QA fails — Backend Architect rolls back to previous version
-rollback("mem_1234567890")
+// QA fails — Backend Architect rolls back everything atomically
+rollback(chk)
+// All post-checkpoint memories deleted, all updated memories restored
 ```
 
 ## Features
@@ -502,8 +529,10 @@ remember("Series A funding closed at $10M",
          ["startup-lead", "retroboard", "funding"],
          "startup")  // domain
 
-// Roll back after a bad update
-rollback("mem_1234567890")
+// Create checkpoint, do work, roll back if needed
+chk = checkpoint("before-changes")
+remember("new API spec v2", ["backend-architect", "retroboard"])
+rollback(chk)  // undoes everything after checkpoint
 ```
 
 ### Using Legacy Tools

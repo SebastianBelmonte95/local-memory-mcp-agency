@@ -109,12 +109,55 @@ def recall(tags: Optional[List[str]] = None, query: Optional[str] = None,
 
 
 @mcp.tool
-def rollback(memory_id: str, domain: Optional[str] = None) -> bool:
+def checkpoint(name: str, tags: Optional[List[str]] = None,
+               domain: Optional[str] = None) -> str:
     """
-    Revert a memory to its previous version.
+    Create a named checkpoint before risky work.
+
+    Use this before making a series of changes that might need to be undone
+    atomically. If something goes wrong, use rollback with the checkpoint ID
+    to undo all changes made after this point.
+
+    Parameters:
+    - name (str): Human-readable name for this checkpoint.
+                  Examples: "before-api-redesign", "pre-schema-migration"
+    - tags (List[str], optional): Tags for organizing checkpoints.
+    - domain (str, optional): Domain for this checkpoint (default: 'default').
+
+    Returns:
+    str: A checkpoint ID to use with rollback.
+    """
+    return memory_api.create_checkpoint(name, domain, tags=tags)
+
+
+@mcp.tool
+def rollback(checkpoint_id: str, domain: Optional[str] = None) -> bool:
+    """
+    Revert to a previous checkpoint, atomically undoing all changes made after it.
+
+    This deletes memories created after the checkpoint and restores memories
+    that were updated after it to their checkpoint-time state.
 
     Use this when a QA check fails or a decision turns out wrong. Instead of
-    manually undoing changes, roll back to the last known-good state.
+    manually undoing changes one by one, roll back to the last known-good state.
+
+    Parameters:
+    - checkpoint_id (str): The checkpoint ID returned by the checkpoint tool.
+    - domain (str, optional): The domain for this checkpoint.
+
+    Returns:
+    bool: True if rollback succeeded, False if checkpoint not found.
+    """
+    return memory_api.rollback_to_checkpoint(checkpoint_id, domain)
+
+
+@mcp.tool
+def rollback_memory(memory_id: str, domain: Optional[str] = None) -> bool:
+    """
+    Revert a single memory to its previous version.
+
+    For surgical single-memory rollback. Each call pops one version from the
+    history stack. Use the checkpoint-based rollback tool for multi-memory recovery.
 
     Parameters:
     - memory_id (str): The ID of the memory to roll back.
@@ -124,6 +167,20 @@ def rollback(memory_id: str, domain: Optional[str] = None) -> bool:
     bool: True if rollback succeeded, False if no previous version exists.
     """
     return memory_api.rollback_memory(memory_id, domain)
+
+
+@mcp.tool
+def list_checkpoints(domain: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    List all available checkpoints for a domain, newest first.
+
+    Parameters:
+    - domain (str, optional): Domain to list checkpoints for (default: 'default').
+
+    Returns:
+    List[Dict]: Checkpoints with id, name, tags, and created_at.
+    """
+    return memory_api.list_checkpoints(domain)
 
 
 @mcp.tool

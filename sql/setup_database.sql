@@ -49,6 +49,15 @@ BEGIN
 
     EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I (memory_id, version_id DESC)',
                    versions_table || '_memory_idx', versions_table);
+
+    -- Create checkpoints table for atomic multi-memory rollback
+    EXECUTE format('
+        CREATE TABLE IF NOT EXISTS %I (
+            id VARCHAR(50) PRIMARY KEY,
+            name TEXT NOT NULL,
+            tags TEXT[] NOT NULL DEFAULT ''{}''::TEXT[],
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        )', domain_name || '_checkpoints');
 END;
 $$ LANGUAGE plpgsql;
 

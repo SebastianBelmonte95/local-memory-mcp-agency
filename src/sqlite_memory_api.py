@@ -55,6 +55,16 @@ class SQLiteMemoryAPI:
         ON memory_versions (memory_id, version_id DESC)
         ''')
 
+        # Create checkpoints table for atomic multi-memory rollback
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS checkpoints (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            tags TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL
+        )
+        ''')
+
         # Migration: add tags column to existing databases that lack it
         cursor.execute("PRAGMA table_info(memories)")
         columns = [row[1] for row in cursor.fetchall()]
@@ -268,6 +278,116 @@ class SQLiteMemoryAPI:
                 pass  # Silently handle vector store update errors
 
         return True
+
+    def create_checkpoint(self, name: str, tags: List[str] = None) -> str:
+        """Create a named checkpoint for atomic multi-memory rollback."""
+        checkpoint_id = f"chk_{int(time.time() * 1000)}"
+        timestamp = time.time()
+        tags = tags or []
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO checkpoints (id, name, tags, created_at) VALUES (?, ?, ?, ?)",
+            (checkpoint_id, name, json.dumps(tags), timestamp)
+        )
+        conn.commit()
+        conn.close()
+        return checkpoint_id
+
+    def rollback_to_checkpoint(self, checkpoint_id: str) -> bool:
+        """Atomically rollback to a checkpoint: delete new memories, restore updated ones."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Get checkpoint timestamp
+        cursor.execute("SELECT created_at FROM checkpoints WHERE id = ?", (checkpoint_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False
+        checkpoint_time = row[0]
+
+        # Step 1: Delete memories created after the checkpoint
+        cursor.execute("SELECT id FROM memories WHERE created_at > ?", (checkpoint_time,))
+        deleted_ids = [r[0] for r in cursor.fetchall()]
+        if deleted_ids:
+            placeholders = ",".join("?" for _ in deleted_ids)
+            cursor.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", deleted_ids)
+            # Clean up any version entries for deleted memories
+            cursor.execute(
+                f"DELETE FROM memory_versions WHERE memory_id IN ({placeholders})", deleted_ids
+            )
+
+        # Step 2: Restore memories that were updated after the checkpoint
+        # Find the oldest version snapshot after checkpoint time for each memory
+        # (this represents the state just before the first post-checkpoint update)
+        cursor.execute("""
+            SELECT mv.memory_id, mv.version_id, mv.content, mv.tags, mv.metadata
+            FROM memory_versions mv
+            INNER JOIN (
+                SELECT memory_id, MIN(version_id) as min_version_id
+                FROM memory_versions
+                WHERE created_at > ?
+                GROUP BY memory_id
+            ) oldest ON mv.memory_id = oldest.memory_id AND mv.version_id = oldest.min_version_id
+        """, (checkpoint_time,))
+
+        restored_ids = []
+        for mem_id, version_id, content, tags_str, metadata_str in cursor.fetchall():
+            # Skip if this memory was already deleted (created after checkpoint)
+            if mem_id in deleted_ids:  # pragma: no cover
+                continue
+            old_metadata = json.loads(metadata_str)
+            old_metadata["updated_at"] = time.time()
+            cursor.execute(
+                "UPDATE memories SET content = ?, tags = ?, metadata = ?, updated_at = ? WHERE id = ?",
+                (content, tags_str, json.dumps(old_metadata), old_metadata["updated_at"], mem_id)
+            )
+            restored_ids.append(mem_id)
+
+        # Step 3: Delete all version entries created after checkpoint
+        cursor.execute("DELETE FROM memory_versions WHERE created_at > ?", (checkpoint_time,))
+
+        # Step 4: Delete the checkpoint and any created after it
+        cursor.execute("DELETE FROM checkpoints WHERE created_at >= ?", (checkpoint_time,))
+
+        conn.commit()
+        conn.close()
+
+        # Update vector store for restored memories
+        if self.vector_store:
+            for mem_id in restored_ids:
+                try:
+                    # Re-read from DB to get the restored state
+                    c = sqlite3.connect(self.db_path)
+                    cur = c.cursor()
+                    cur.execute("SELECT content, metadata FROM memories WHERE id = ?", (mem_id,))
+                    r = cur.fetchone()
+                    c.close()
+                    if r:
+                        self.vector_store.update_text(mem_id, r[0], json.loads(r[1]))
+                except Exception:
+                    pass
+
+        return True
+
+    def list_checkpoints(self) -> List[Dict[str, Any]]:
+        """List all checkpoints, newest first."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, tags, created_at FROM checkpoints ORDER BY created_at DESC")
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                "id": row["id"],
+                "name": row["name"],
+                "tags": json.loads(row["tags"]),
+                "created_at": row["created_at"],
+            })
+        conn.close()
+        return results
 
     def rollback_memory(self, memory_id: str) -> bool:
         """Rollback a memory to its previous version."""

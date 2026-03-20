@@ -396,3 +396,193 @@ class TestRollbackMemory:
         # Should not raise
         result = api.rollback_memory(mem_id)
         assert result is True
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestCreateCheckpoint:
+    def test_returns_id(self, sqlite_memory_api):
+        chk_id = sqlite_memory_api.create_checkpoint("save point")
+        assert chk_id.startswith("chk_")
+
+    def test_stores_in_db(self, sqlite_memory_api):
+        chk_id = sqlite_memory_api.create_checkpoint("my save", tags=["a", "b"])
+        conn = sqlite3.connect(sqlite_memory_api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name, tags FROM checkpoints WHERE id = ?", (chk_id,))
+        row = cursor.fetchone()
+        assert row[0] == "my save"
+        assert json.loads(row[1]) == ["a", "b"]
+        conn.close()
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestRollbackToCheckpoint:
+    def test_deletes_new_memories(self, sqlite_memory_api):
+        api = sqlite_memory_api
+        api.store_memory("before checkpoint")
+        time.sleep(0.01)
+        chk_id = api.create_checkpoint("save")
+        time.sleep(0.01)
+        api.store_memory("after checkpoint")
+        api.rollback_to_checkpoint(chk_id)
+        # Only the pre-checkpoint memory should remain
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM memories")
+        assert cursor.fetchone()[0] == 1
+        cursor.execute("SELECT content FROM memories")
+        assert cursor.fetchone()[0] == "before checkpoint"
+        conn.close()
+
+    def test_restores_updated_memories(self, sqlite_memory_api):
+        api = sqlite_memory_api
+        mem_id = api.store_memory("original content", tags=["old-tag"])
+        time.sleep(0.01)
+        chk_id = api.create_checkpoint("save")
+        time.sleep(0.01)
+        api.update_memory(mem_id, content="modified content", tags=["new-tag"])
+        api.rollback_to_checkpoint(chk_id)
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT content, tags FROM memories WHERE id = ?", (mem_id,))
+        row = cursor.fetchone()
+        assert row[0] == "original content"
+        assert json.loads(row[1]) == ["old-tag"]
+        conn.close()
+
+    def test_mixed_scenario(self, sqlite_memory_api):
+        """Some memories created, some updated, some untouched after checkpoint."""
+        api = sqlite_memory_api
+        untouched_id = api.store_memory("untouched")
+        updated_id = api.store_memory("will be updated")
+        time.sleep(0.01)
+        chk_id = api.create_checkpoint("save")
+        time.sleep(0.01)
+        new_id = api.store_memory("new after checkpoint")
+        api.update_memory(updated_id, content="modified")
+        api.rollback_to_checkpoint(chk_id)
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        # New memory should be deleted
+        cursor.execute("SELECT 1 FROM memories WHERE id = ?", (new_id,))
+        assert cursor.fetchone() is None
+        # Updated memory should be restored
+        cursor.execute("SELECT content FROM memories WHERE id = ?", (updated_id,))
+        assert cursor.fetchone()[0] == "will be updated"
+        # Untouched memory should still exist
+        cursor.execute("SELECT content FROM memories WHERE id = ?", (untouched_id,))
+        assert cursor.fetchone()[0] == "untouched"
+        conn.close()
+
+    def test_checkpoint_not_found(self, sqlite_memory_api):
+        assert sqlite_memory_api.rollback_to_checkpoint("chk_nonexistent") is False
+
+    def test_cleans_up_versions_and_checkpoint(self, sqlite_memory_api):
+        api = sqlite_memory_api
+        mem_id = api.store_memory("content")
+        time.sleep(0.01)
+        chk_id = api.create_checkpoint("save")
+        time.sleep(0.01)
+        api.update_memory(mem_id, content="changed")
+        api.rollback_to_checkpoint(chk_id)
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM memory_versions")
+        assert cursor.fetchone()[0] == 0
+        cursor.execute("SELECT COUNT(*) FROM checkpoints")
+        assert cursor.fetchone()[0] == 0
+        conn.close()
+
+    def test_deletes_later_checkpoints(self, sqlite_memory_api):
+        api = sqlite_memory_api
+        time.sleep(0.01)
+        chk1 = api.create_checkpoint("first")
+        time.sleep(0.01)
+        chk2 = api.create_checkpoint("second")
+        api.rollback_to_checkpoint(chk1)
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM checkpoints")
+        assert cursor.fetchone()[0] == 0  # both deleted (>= checkpoint time)
+        conn.close()
+
+    def test_vector_store_error_on_restore_silent(self, tmp_path, mock_ollama_embeddings):
+        from unittest.mock import patch, MagicMock
+        from sqlite_vector_api import FAISSVectorAPI
+
+        data_dir = str(tmp_path / "vs_err")
+        with patch("sqlite_vector_api.OllamaEmbeddings", return_value=mock_ollama_embeddings):
+            vs = FAISSVectorAPI(data_dir=data_dir)
+
+        db_path = str(tmp_path / "chk_err.db")
+        api = SQLiteMemoryAPI(db_path=db_path, vector_store=vs)
+        mem_id = api.store_memory("original")
+        time.sleep(0.01)
+        chk_id = api.create_checkpoint("save")
+        time.sleep(0.01)
+        api.update_memory(mem_id, content="changed")
+        # Break the vector store
+        vs.update_text = MagicMock(side_effect=RuntimeError("broken"))
+        # Should not raise
+        result = api.rollback_to_checkpoint(chk_id)
+        assert result is True
+
+    def test_vector_store_updated_on_restore(self, tmp_path, mock_ollama_embeddings):
+        from unittest.mock import patch
+        from sqlite_vector_api import FAISSVectorAPI
+
+        data_dir = str(tmp_path / "vs_data")
+        with patch("sqlite_vector_api.OllamaEmbeddings", return_value=mock_ollama_embeddings):
+            vs = FAISSVectorAPI(data_dir=data_dir)
+
+        db_path = str(tmp_path / "chk.db")
+        api = SQLiteMemoryAPI(db_path=db_path, vector_store=vs)
+
+        mem_id = api.store_memory("original")
+        time.sleep(0.01)
+        chk_id = api.create_checkpoint("save")
+        time.sleep(0.01)
+        api.update_memory(mem_id, content="changed")
+        api.rollback_to_checkpoint(chk_id)
+        # Verify the memory was restored in DB
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT content FROM memories WHERE id = ?", (mem_id,))
+        assert cursor.fetchone()[0] == "original"
+        conn.close()
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestListCheckpoints:
+    def test_returns_checkpoints(self, sqlite_memory_api):
+        sqlite_memory_api.create_checkpoint("first")
+        time.sleep(0.01)
+        sqlite_memory_api.create_checkpoint("second")
+        result = sqlite_memory_api.list_checkpoints()
+        assert len(result) == 2
+        assert result[0]["name"] == "second"  # newest first
+        assert result[1]["name"] == "first"
+
+    def test_empty(self, sqlite_memory_api):
+        assert sqlite_memory_api.list_checkpoints() == []
+
+    def test_includes_tags(self, sqlite_memory_api):
+        sqlite_memory_api.create_checkpoint("tagged", tags=["a", "b"])
+        result = sqlite_memory_api.list_checkpoints()
+        assert result[0]["tags"] == ["a", "b"]
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestCheckpointSchema:
+    def test_checkpoints_table_exists(self, tmp_path):
+        db_path = str(tmp_path / "test.db")
+        SQLiteMemoryAPI(db_path=db_path)
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='checkpoints'")
+        assert cursor.fetchone() is not None
+        conn.close()
