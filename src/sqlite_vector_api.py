@@ -265,7 +265,7 @@ class FAISSVectorAPI:
         seen_text_ids = set()
         
         for i, idx in enumerate(I[0]):
-            if idx >= len(self.metadata["chunks"]):
+            if idx < 0 or idx >= len(self.metadata["chunks"]):
                 continue
                 
             chunk = self.metadata["chunks"][idx]

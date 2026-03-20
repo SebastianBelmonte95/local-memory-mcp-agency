@@ -18,9 +18,11 @@ A production-ready persistent memory system for AI agents using the [Model Conte
 - [Why This Matters](#why-this-matters)
 - [Choose Your Implementation](#choose-your-implementation)
 - [Tools & Capabilities](#tools--capabilities)
-  - [Available Tools](#available-tools)
+  - [Agency-Agents Tools](#agency-agents-tools-primary)
+  - [Legacy Tools](#legacy-tools)
   - [Available Resources](#available-resources)
   - [Available Prompts](#available-prompts)
+- [Agency-Agents Integration](#agency-agents-integration)
 - [Architecture Diagrams](#architectures)
   - [SQLite + FAISS Implementation](#sqlite--faiss-implementation-original)
   - [PostgreSQL + pgvector Implementation](#postgresql--pgvector-implementation-new)
@@ -113,34 +115,94 @@ graph LR
     class DC,DC2 domain
 ```
 
-### Available Tools
+### Agency-Agents Tools (Primary)
+
+These tools are compatible with the [Agency-Agents](https://github.com/msitarzewski/agency-agents) multi-agent workflow system.
+
+#### `remember`
+Store decisions, deliverables, and context with tags for organized recall.
+- `remember(content, tags?, source?, importance?, domain?)`
+- **Tags** are the primary organizational mechanism — use agent name, project name, and topic
+- **Examples**:
+  ```javascript
+  remember("API spec: GET /products returns Product[]",
+           ["backend-architect", "retroboard", "api-spec", "frontend-developer"])
+  ```
+
+#### `recall`
+Search for relevant memories by tag, keyword, or semantic similarity.
+- `recall(tags?, query?, domain?, limit?)`
+- When **tags** are provided, filters to memories matching ALL specified tags (AND logic)
+- **Examples**:
+  ```javascript
+  recall(["backend-architect", "retroboard"])  // find all memories from this agent+project
+  recall(["frontend-developer"], "api spec")   // tags + semantic search
+  ```
+
+#### `checkpoint`
+Create a named save point before risky work.
+- `checkpoint(name, tags?, domain?)`
+- Returns a checkpoint ID to use with `rollback`
+- **Use case**: Before a series of changes that might need to be undone atomically
+
+#### `rollback`
+Atomically revert to a checkpoint, undoing all changes made after it.
+- `rollback(checkpoint_id, domain?)`
+- Deletes memories created after the checkpoint
+- Restores memories updated after the checkpoint to their checkpoint-time state
+- **Use case**: QA check fails, bad architecture decision — roll back everything at once
+
+#### `rollback_memory`
+Revert a single memory to its previous version.
+- `rollback_memory(memory_id, domain?)`
+- Per-memory version stack (v3 → v2 → v1)
+- **Use case**: Surgical fix to one memory without affecting others
+
+#### `list_checkpoints`
+List available checkpoints for a domain.
+- `list_checkpoints(domain?)`
+- Returns checkpoints ordered newest first
+
+#### `purge_expired`
+Delete all expired memories (those past their TTL).
+- `purge_expired(domain?)`
+- **Use case**: Periodic cleanup of temporal memories, triggered manually or via cron
+
+#### `consolidate_memories`
+Compress old memories matching tags into LLM-generated summaries.
+- `consolidate_memories(tags, older_than_days?, domain?)`
+- Originals are deleted, summaries preserve key decisions and outcomes
+- Summaries tagged with `["consolidated"]` and carry `consolidated_from` audit trail
+- **Use case**: Project milestone reached, compress 50 sprint notes into 3 summaries
+- **Warning**: Lossy compression — granular details (URLs, error codes) may not survive
+
+#### `search`
+Find specific memories across sessions and agents using semantic or text search.
+- `search(query, domain?, limit?, use_vector?)`
+- Unlike `recall`, this performs broad content-based retrieval without tag filtering
+- **Examples**:
+  ```javascript
+  search("database schema decisions", "startup", 5)
+  ```
+
+### Legacy Tools
+
+These are kept for backward compatibility with existing MCP clients.
 
 #### `store_memory`
-Store new information in persistent memory with automatic semantic indexing.
 - **SQLite**: `store_memory(content, source?, importance?)`
 - **PostgreSQL**: `store_memory(content, domain?, source?, importance?)`
-- **Examples**:
-  - `"User prefers TypeScript over JavaScript for new projects"`
-  - `"Weekly team meeting every Tuesday at 2 PM PST"`
 
-#### `update_memory` 
-Modify existing memories while preserving search indexing.
+#### `update_memory`
 - **SQLite**: `update_memory(memory_id, content?, importance?)`
 - **PostgreSQL**: `update_memory(memory_id, content?, importance?, domain?)`
-- **Use case**: Update outdated information or change importance levels
 
 #### `search_memories`
-Find relevant memories using semantic or keyword search.
 - **SQLite**: `search_memories(query, limit?, use_vector?)`
 - **PostgreSQL**: `search_memories(query, domain?, limit?)`
-- **Examples**: 
-  - `"What programming languages does the user prefer?"`
-  - `"Recent project decisions about database choices"`
 
 #### `list_memory_domains` *(PostgreSQL Only)*
-Discover available memory domains for organized context switching.
 - **Returns**: `["default", "work", "health", "personal"]`
-- **Use case**: Switch between different memory contexts
 
 ### Available Resources
 
@@ -277,6 +339,88 @@ graph TB
     class DT1,DT2,DT3,PGV storage
     class OL,EM external
 ```
+## Agency-Agents Integration
+
+This server is compatible with the [Agency-Agents](https://github.com/msitarzewski/agency-agents) multi-agent workflow system. It provides the four tools that agency-agents expects: `remember`, `recall`, `rollback`, and `search`.
+
+### MCP Client Configuration
+
+Add this to your MCP client config (Claude Code, Cursor, etc.) to use with agency-agents workflows:
+
+**Claude Code** (via CLI):
+```bash
+claude mcp add --transport stdio memory-server -- python3 src/postgres_memory_server.py
+```
+
+**Claude Code** (via `.mcp.json` in project root):
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["/path/to/local-memory-mcp/src/postgres_memory_server.py"]
+    }
+  }
+}
+```
+
+**Docker version:**
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "docker",
+      "args": ["run", "--rm", "-i",
+               "-v", "/path/to/postgres-data:/var/lib/postgresql/data",
+               "cunicopia/local-memory-mcp:postgres"]
+    }
+  }
+}
+```
+
+### Workflow Pattern
+
+Once configured, add a **Memory Integration** section to any agent prompt (see [agency-agents integration docs](https://github.com/msitarzewski/agency-agents/tree/main/integrations/mcp-memory)):
+
+```
+When you start a session:
+- recall(tags=["your-agent-name", "project-name"]) to pick up previous context
+
+When you make key decisions or complete deliverables:
+- remember("what you decided and why", tags=["your-agent-name", "project-name", "topic"])
+
+When handing off to another agent:
+- remember("deliverable content", tags=["receiving-agent-name", "project-name"])
+
+Before risky multi-step changes:
+- checkpoint("before-redesign", tags=["your-agent-name", "project-name"])
+
+When something fails:
+- rollback(checkpoint_id) to atomically undo all changes since the checkpoint
+- rollback_memory(memory_id) to surgically revert a single memory
+```
+
+### Multi-Agent Handoff Example
+
+```javascript
+// Backend Architect creates a checkpoint before risky redesign
+chk = checkpoint("before-api-redesign", ["backend-architect", "retroboard"])
+
+// Backend Architect stores new deliverables
+remember("REST API v2: GET /api/products returns Product[]",
+         ["backend-architect", "retroboard", "api-spec", "frontend-developer"])
+remember("New DB schema with sharding",
+         ["backend-architect", "retroboard", "db-schema"])
+
+// Frontend Developer recalls what was left for them
+recall(["frontend-developer", "retroboard"])
+
+// QA fails — Backend Architect rolls back everything atomically
+rollback(chk)
+// All post-checkpoint memories deleted, all updated memories restored
+```
+
 ## Features
 
 ### Common Features
@@ -381,48 +525,39 @@ Once you have the Docker containers ready (or local installation), connect to Cl
 
 ## Examples
 
-### SQLite Implementation
+### Using Agency-Agents Tools (Recommended)
 ```javascript
-// Store a memory
-store_memory(
-  "User prefers Python for backend development", 
-  "conversation", 
-  0.8
-)
+// Store a decision with tags
+remember("User prefers Python for backend development",
+         ["user-preferences", "tech-stack"])
 
-// Search memories
-search_memories("programming preferences", 5, true)
+// Recall by tags
+recall(["user-preferences"])
 
-// Get memories via resource
-// Access: memory://programming
+// Broad semantic search
+search("programming preferences")
+
+// Store in a specific domain (PostgreSQL)
+remember("Series A funding closed at $10M",
+         ["startup-lead", "retroboard", "funding"],
+         "startup")  // domain
+
+// Create checkpoint, do work, roll back if needed
+chk = checkpoint("before-changes")
+remember("new API spec v2", ["backend-architect", "retroboard"])
+rollback(chk)  // undoes everything after checkpoint
 ```
 
-### PostgreSQL Implementation
+### Using Legacy Tools
 ```javascript
-// List available domains
-list_memory_domains()
-// Returns: ["default", "startup", "health"]
+// SQLite
+store_memory("User prefers Python for backend development", "conversation", 0.8)
+search_memories("programming preferences", 5, true)
 
-// Store memories in different domains
-store_memory(
-  "Series A funding closed at $10M",
-  "startup",  // domain
-  "meeting",   // source
-  0.9         // importance
-)
-
-store_memory(
-  "User has peanut allergy",
-  "health",
-  "medical_record",
-  1.0
-)
-
-// Search within specific domain
+// PostgreSQL with domains
+store_memory("Series A funding closed at $10M", "startup", "meeting", 0.9)
 search_memories("funding", "startup", 5)
-
-// Get memories via resource
-// Access: memory://startup/funding%20strategy
+list_memory_domains()  // Returns: ["default", "startup", "health"]
 ```
 
 ## Components
@@ -446,7 +581,10 @@ search_memories("funding", "startup", 5)
 ### Common Environment Variables
 - `OLLAMA_API_URL`: Ollama endpoint (default: `http://localhost:11434`)
 - `OLLAMA_EMBEDDING_MODEL`: Model name (default: `nomic-embed-text`)
+- `OLLAMA_CHAT_MODEL`: Chat model for consolidation summaries (default: `llama3`)
 - `MCP_SERVER_NAME`: Server name for MCP (default: `Local Context Memory`)
+- `MAX_VERSIONS_PER_MEMORY`: Version history cap per memory (default: `20`)
+- `CHECKPOINT_RETENTION_DAYS`: Auto-delete checkpoints older than this (default: `30`)
 
 ### SQLite Specific
 - `MCP_DATA_DIR`: Data storage path (default: `./data`)
@@ -458,6 +596,25 @@ search_memories("funding", "startup", 5)
 - `POSTGRES_USER`: Database user (default: `postgres`)
 - `POSTGRES_PASSWORD`: Database password (required)
 - `DEFAULT_MEMORY_DOMAIN`: Default domain for memories (default: `default`)
+
+## Memory Lifecycle
+
+Memories grow over time. Three strategies manage this:
+
+**TTL Expiration** — for inherently temporal memories (meeting times, sprint status, workarounds):
+```javascript
+remember("Meeting moved to 3pm Tuesday", ["team"], ttl_seconds=259200)  // expires in 3 days
+purge_expired()  // clean up after expiry
+```
+
+**Consolidation** — for valuable but numerous memories (project decisions, architecture notes):
+```javascript
+// At a project milestone, compress 50 sprint notes into summaries
+consolidate_memories(["retroboard"], older_than_days=30)
+// Originals deleted, summaries tagged ["retroboard", "consolidated"]
+```
+
+**Neither** — for permanently critical memories (compliance requirements, security constraints, core preferences). Just store them normally without TTL.
 
 ## Development
 
