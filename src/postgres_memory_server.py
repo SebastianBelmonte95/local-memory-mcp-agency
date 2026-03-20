@@ -16,7 +16,7 @@ mcp = FastMCP(name=server_name)
 ollama_available = False
 ollama_url = os.environ.get("OLLAMA_API_URL", "http://localhost:11434")
 embedding_model = os.environ.get("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text:v1.5")
-keep_alive = os.environ.get("OLLAMA_KEEP_ALIVE", "10m")  # Keep model in memory for 10 minutes by default
+keep_alive = os.environ.get("OLLAMA_KEEP_ALIVE", "10m")
 ollama_embeddings = None
 
 try:
@@ -25,7 +25,7 @@ try:
     if response.status_code == 200:
         models = response.json().get("models", [])
         model_names = [model.get("name", "") for model in models]
-        
+
         if embedding_model in model_names:
             ollama_available = True
             ollama_embeddings = OllamaEmbeddings(
@@ -43,222 +43,233 @@ except Exception as e:
 # Initialize the PostgreSQL memory API
 memory_api = PostgresMemoryAPI(ollama_embeddings=ollama_embeddings)
 
+
+# ── Agency-Agents compatible tools ──────────────────────────────────────────
+
 @mcp.tool
-def store_memory(content: str, domain: Optional[str] = None, 
-                 source: Optional[str] = None, importance: Optional[float] = None) -> str:
+def remember(content: str, tags: Optional[List[str]] = None,
+             domain: Optional[str] = None, source: Optional[str] = None,
+             importance: Optional[float] = None) -> str:
     """
-    Store a new memory chunk in the persistent memory system.
-    
-    This tool allows you to save important information that should be remembered across conversations.
-    The content will be automatically indexed for semantic search (if Ollama is available) or text search.
-    
+    Store a decision, deliverable, or context snapshot with tags for later recall.
+
+    Use this whenever you make a key decision, complete a deliverable, or want to
+    preserve context for future sessions or other agents.
+
     Parameters:
-    - content (str): The text content to remember. This can be facts, preferences, context, 
-                    or any information that should persist. Examples:
-                    * "User prefers Python over JavaScript for backend development"
-                    * "Meeting scheduled for Tuesday at 3pm about project planning"
-                    * "User's favorite color is blue and they work in San Francisco"
-    
-    - domain (str, optional): The domain/context for this memory. Memories are segmented by domain
-                             for better retrieval accuracy. Defaults to 'default'. Examples:
-                             * "startup" - for business-related memories
-                             * "health" - for health-related information
-                             * "personal" - for personal preferences
-                             
-    - source (str, optional): Where this memory originated from. Examples:
-                              * "conversation"
-                              * "document"  
-                              * "email"
-                              * "meeting_notes"
-                              
-    - importance (float, optional): Importance score from 0.0 to 1.0 where:
-                                   * 0.0-0.3 = Low importance (casual mentions)
-                                   * 0.4-0.7 = Medium importance (useful context)
-                                   * 0.8-1.0 = High importance (critical information)
-    
+    - content (str): What to remember. Include enough context that a future session
+                    or a different agent can understand what was done and why.
+    - tags (List[str], optional): Tags for organizing and finding this memory later.
+                                  Use agent name, project name, and topic as tags.
+                                  Examples: ["backend-architect", "retroboard", "api-spec"]
+    - domain (str, optional): Memory domain for segmentation (default: 'default').
+    - source (str, optional): Where this memory originated from.
+    - importance (float, optional): Importance score from 0.0 to 1.0.
+
     Returns:
-    str: A unique memory ID that can be used to update or reference this memory later.
-    
-    Example usage:
-    - store_memory("User loves hiking in the mountains", "personal", "conversation", 0.7)
-    - store_memory("Series A funding closed at $10M", "startup", "meeting", 0.9)
+    str: A unique memory ID for referencing this memory later.
     """
     metadata = {}
     if source:
         metadata["source"] = source
     if importance is not None:
         metadata["importance"] = importance
-    
-    memory_id = memory_api.store_memory(content, metadata, domain)
+
+    memory_id = memory_api.store_memory(content, metadata, domain, tags=tags)
     return memory_id
 
-@mcp.tool
-def update_memory(memory_id: str, content: Optional[str] = None, 
-                  importance: Optional[float] = None, domain: Optional[str] = None) -> bool:
-    """
-    Update an existing memory chunk with new information.
-    
-    This tool allows you to modify previously stored memories. You can update the content,
-    change the importance level. If updating content, the memory will be
-    re-indexed for search.
-    
-    Parameters:
-    - memory_id (str): The unique ID of the memory to update (returned from store_memory).
-                      Example: "mem_1234567890123"
-    
-    - content (str, optional): New content to replace the existing memory content.
-                              If provided, this completely replaces the old content.
-                              Example: "User prefers React over Vue for frontend projects"
-                                 
-    - importance (float, optional): New importance score from 0.0 to 1.0.
-                                   * 0.0-0.3 = Low importance
-                                   * 0.4-0.7 = Medium importance  
-                                   * 0.8-1.0 = High importance
-                                   
-    - domain (str, optional): The domain where this memory is stored.
-                             If not specified, uses the default domain.
-    
-    Returns:
-    bool: True if the update was successful, False if the memory_id was not found.
-    
-    Example usage:
-    - update_memory("mem_1234567890123", content="User now prefers TypeScript over JavaScript")
-    - update_memory("mem_1234567890123", importance=0.9)
-    """
-    metadata = {}
-    if importance is not None:
-        metadata["importance"] = importance
-    
-    success = memory_api.update_memory(memory_id, content, metadata, domain)
-    return success
 
-@mcp.resource("memory://{domain}/{query}")
-def get_memories(domain: str, query: str, limit: Optional[int] = 5) -> List[Dict[str, Any]]:
+@mcp.tool
+def recall(tags: Optional[List[str]] = None, query: Optional[str] = None,
+           domain: Optional[str] = None,
+           limit: Optional[int] = 5) -> List[Dict[str, Any]]:
     """
-    Retrieve memories from a specific domain using semantic or text search.
-    
-    This resource performs intelligent search within a specific domain,
-    finding relevant content based on the query. Uses vector embeddings if available,
-    falls back to text search otherwise.
-    
-    URI Pattern: memory://{domain}/{query}
-    
+    Search for relevant memories by tag, keyword, or semantic similarity.
+
+    Use this at the start of a session to pick up context from previous sessions,
+    or when you need to find what a specific agent produced.
+
     Parameters:
-    - domain (str): The domain to search within. Examples:
-                   * "default" - general memories
-                   * "startup" - business context
-                   * "health" - health information
-                   * "personal" - personal preferences
-    
-    - query (str): The search query to find relevant memories. This can be:
-                  * Natural language questions: "What does the user like to do?"
-                  * Keywords: "python programming preferences" 
-                  * Concepts: "work schedule" or "personal information"
-                  * Specific topics: "machine learning projects"
-    
+    - tags (List[str], optional): Filter to memories matching ALL of these tags.
+                                  Examples: ["backend-architect", "retroboard"]
+    - query (str, optional): Search query for semantic or text matching.
+    - domain (str, optional): Domain to search within (default: 'default').
     - limit (int, optional): Maximum number of memories to return (default: 5).
-                            Higher values return more results but may include less relevant ones.
-                            Recommended range: 3-10.
-    
+
     Returns:
-    List[Dict[str, Any]]: A list of memory objects, each containing:
-        - id (str): Unique memory identifier
-        - content (str): The stored memory content
-        - metadata (dict): Associated metadata including source, importance, timestamps
-        - score (float): Relevance score (higher = more relevant)
-    
-    Example URIs:
-    - memory://startup/funding%20strategy
-    - memory://health/blood%20pressure
-    - memory://default/programming%20preferences
+    List[Dict]: Matching memories with id, content, tags, metadata, and score.
     """
-    results = memory_api.retrieve_memories(query, limit, domain)
+    results = memory_api.retrieve_memories(
+        query=query or "", limit=limit, domain=domain, tags=tags
+    )
+    for result in results:
+        if "score" not in result:
+            result["score"] = 0.0
     return results
 
+
 @mcp.tool
-def search_memories(query: str, domain: Optional[str] = None, 
-                   limit: Optional[int] = 5) -> List[Dict[str, Any]]:
+def rollback(memory_id: str, domain: Optional[str] = None) -> bool:
     """
-    Search for memories within a specific domain or the default domain.
-    
-    This tool provides semantic search (if Ollama is available) or text search
-    across memories in the specified domain. Domain segmentation ensures
-    queries return contextually relevant results.
-    
+    Revert a memory to its previous version.
+
+    Use this when a QA check fails or a decision turns out wrong. Instead of
+    manually undoing changes, roll back to the last known-good state.
+
     Parameters:
-    - query (str): The search query to find relevant memories. Examples:
-                  * "What does the user like for breakfast?"
-                  * "programming projects and preferences"
-                  * "work meetings this week"
-                  * "personal goals and aspirations"
-    
-    - domain (str, optional): The domain to search within. If not specified,
-                             searches the default domain. Examples:
-                             * "startup" - business memories
-                             * "health" - health information
-                             * "personal" - personal data
-    
-    - limit (int, optional): Maximum number of memories to return (default: 5).
-                            Range: 1-20. Higher values may include less relevant results.
-    
+    - memory_id (str): The ID of the memory to roll back.
+    - domain (str, optional): The domain where this memory is stored.
+
     Returns:
-    List[Dict[str, Any]]: A list of memory objects with search metadata:
-        - id (str): Unique memory identifier
-        - content (str): The stored memory content  
-        - metadata (dict): Memory metadata (source, importance, timestamps)
-        - score (float): Relevance/similarity score
-        - query (str): The original search query (for reference)
-    
-    Example usage:
-    - search_memories("user preferences", "personal", 3)
-    - search_memories("python programming", limit=10)  # searches default domain
-    - search_memories("recent meetings", "startup", 5)
+    bool: True if rollback succeeded, False if no previous version exists.
+    """
+    return memory_api.rollback_memory(memory_id, domain)
+
+
+@mcp.tool
+def search(query: str, domain: Optional[str] = None,
+           limit: Optional[int] = 5) -> List[Dict[str, Any]]:
+    """
+    Find specific memories across sessions and agents using semantic or text search.
+
+    Unlike recall (which filters by tags), search performs broad content-based
+    retrieval across all memories in a domain.
+
+    Parameters:
+    - query (str): The search query.
+    - domain (str, optional): Domain to search within (default: 'default').
+    - limit (int, optional): Maximum results to return (default: 5).
+
+    Returns:
+    List[Dict]: Matching memories with id, content, tags, metadata, score, and query.
     """
     results = memory_api.retrieve_memories(query, limit, domain)
-    
-    # Add search information
     for result in results:
         result["query"] = query
         if "score" not in result:
             result["score"] = 0.0
-    
     return results
+
+
+# ── Legacy tools (backward compatibility) ───────────────────────────────────
+
+@mcp.tool
+def store_memory(content: str, domain: Optional[str] = None,
+                 source: Optional[str] = None, importance: Optional[float] = None) -> str:
+    """
+    Store a new memory chunk in the persistent memory system.
+    (Legacy interface — prefer 'remember' for new usage.)
+
+    Parameters:
+    - content (str): The text content to remember.
+    - domain (str, optional): The domain/context for this memory.
+    - source (str, optional): Where this memory originated from.
+    - importance (float, optional): Importance score from 0.0 to 1.0.
+
+    Returns:
+    str: A unique memory ID.
+    """
+    metadata = {}
+    if source:
+        metadata["source"] = source
+    if importance is not None:
+        metadata["importance"] = importance
+
+    memory_id = memory_api.store_memory(content, metadata, domain)
+    return memory_id
+
+
+@mcp.tool
+def update_memory(memory_id: str, content: Optional[str] = None,
+                  importance: Optional[float] = None, domain: Optional[str] = None) -> bool:
+    """
+    Update an existing memory chunk with new information.
+    (Legacy interface.)
+
+    Parameters:
+    - memory_id (str): The unique ID of the memory to update.
+    - content (str, optional): New content to replace existing content.
+    - importance (float, optional): New importance score from 0.0 to 1.0.
+    - domain (str, optional): The domain where this memory is stored.
+
+    Returns:
+    bool: True if successful, False if memory_id not found.
+    """
+    metadata = {}
+    if importance is not None:
+        metadata["importance"] = importance
+
+    success = memory_api.update_memory(memory_id, content, metadata, domain)
+    return success
+
+
+@mcp.tool
+def search_memories(query: str, domain: Optional[str] = None,
+                    limit: Optional[int] = 5) -> List[Dict[str, Any]]:
+    """
+    Search for memories within a specific domain.
+    (Legacy interface — prefer 'search' for new usage.)
+
+    Parameters:
+    - query (str): The search query.
+    - domain (str, optional): Domain to search within.
+    - limit (int, optional): Maximum results (default: 5).
+
+    Returns:
+    List[Dict]: Matching memories with search metadata.
+    """
+    results = memory_api.retrieve_memories(query, limit, domain)
+    for result in results:
+        result["query"] = query
+        if "score" not in result:
+            result["score"] = 0.0
+    return results
+
 
 @mcp.tool
 def list_memory_domains() -> List[str]:
     """
     List all available memory domains in the database.
-    
-    This tool returns a list of all domain tables that have been created in the database.
-    Each domain represents a separate context for storing memories (e.g., 'default', 'startup', 'health').
-    
+
     Returns:
-    List[str]: A list of domain names that can be used with store_memory and search_memories.
-    
-    Example usage:
-    - list_memory_domains() might return: ["default", "startup", "health", "personal"]
-    
-    This is useful for:
-    - Discovering what domains are available before storing/searching
-    - Understanding the organization of stored memories
-    - Validating domain names before use
+    List[str]: Domain names that can be used with remember, recall, and search.
     """
     return memory_api.list_domains()
+
+
+@mcp.resource("memory://{domain}/{query}")
+def get_memories(domain: str, query: str, limit: Optional[int] = 5) -> List[Dict[str, Any]]:
+    """
+    Retrieve memories from a specific domain using semantic or text search.
+
+    URI Pattern: memory://{domain}/{query}
+
+    Parameters:
+    - domain (str): The domain to search within.
+    - query (str): The search query.
+    - limit (int, optional): Maximum memories to return (default: 5).
+
+    Returns:
+    List[Dict]: Matching memory objects.
+    """
+    results = memory_api.retrieve_memories(query, limit, domain)
+    return results
+
 
 @mcp.prompt
 def summarize_memories(memories: List[Dict[str, Any]]) -> str:
     """
     Create a prompt for summarizing a list of memories.
-    
+
     Parameters:
     - memories: List of memory chunks to summarize
-    
+
     Returns:
     - A prompt for the LLM to create a summary
     """
     memory_texts = [f"Memory {i+1}: {mem['content']}" for i, mem in enumerate(memories)]
     formatted_memories = "\n".join(memory_texts)
-    
+
     prompt = f"""Below are several memory chunks related to a user's interests and history.
 Please create a concise summary that captures the key points and patterns:
 
@@ -268,5 +279,5 @@ Summary:"""
 
     return prompt
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     mcp.run()  # Start the FastMCP server

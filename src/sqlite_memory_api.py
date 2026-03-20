@@ -15,53 +15,79 @@ class SQLiteMemoryAPI:
             self.db_path = os.path.join(data_dir, "memory.db")
         else:
             self.db_path = db_path
-            
+
         self._initialize_db()
-        
+
         # Initialize vector store
         self.vector_store = vector_store
-    
+
     def _initialize_db(self):
         """Initialize the SQLite database with required tables."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         # Create memories table
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS memories (
             id TEXT PRIMARY KEY,
             content TEXT NOT NULL,
+            tags TEXT NOT NULL DEFAULT '[]',
             metadata TEXT NOT NULL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         )
         ''')
-        
+
+        # Create version history table for rollback support
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS memory_versions (
+            version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tags TEXT NOT NULL DEFAULT '[]',
+            metadata TEXT NOT NULL,
+            created_at REAL NOT NULL
+        )
+        ''')
+
+        cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_memory_versions_memory_id
+        ON memory_versions (memory_id, version_id DESC)
+        ''')
+
+        # Migration: add tags column to existing databases that lack it
+        cursor.execute("PRAGMA table_info(memories)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "tags" not in columns:
+            cursor.execute("ALTER TABLE memories ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
+
         conn.commit()
         conn.close()
-    
-    def store_memory(self, content: str, metadata: Dict[str, Any] = None) -> str:
+
+    def store_memory(self, content: str, metadata: Dict[str, Any] = None,
+                     tags: List[str] = None) -> str:
         """Store a new memory chunk in the database."""
         memory_id = f"mem_{int(time.time() * 1000)}"
         timestamp = time.time()
-        
+        tags = tags or []
+
         metadata = metadata or {}
         metadata.update({
             "created_at": timestamp,
             "updated_at": timestamp,
         })
-        
+
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         cursor.execute(
-            "INSERT INTO memories (id, content, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-            (memory_id, content, json.dumps(metadata), timestamp, timestamp)
+            "INSERT INTO memories (id, content, tags, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (memory_id, content, json.dumps(tags), json.dumps(metadata), timestamp, timestamp)
         )
-        
+
         conn.commit()
         conn.close()
-        
+
         # Add to vector store if available
         if self.vector_store:
             try:
@@ -69,20 +95,22 @@ class SQLiteMemoryAPI:
             except Exception as e:
                 pass  # Silently handle vector store errors
         return memory_id
-    
-    def retrieve_memories(self, query: str, limit: int = 5, use_vector: bool = True) -> List[Dict[str, Any]]:
+
+    def retrieve_memories(self, query: str, limit: int = 5, use_vector: bool = True,
+                          tags: List[str] = None) -> List[Dict[str, Any]]:
         """
         Retrieve memories relevant to the query.
-        
+
         If vector_store is available and use_vector is True, use semantic search.
         Otherwise, fall back to SQL text search.
+        When tags are provided, filter results to only include memories matching ALL tags.
         """
         # Try vector search first if available and requested
         if self.vector_store and use_vector:
             try:
                 # Performing vector search
-                vector_results = self.vector_store.search(query, limit)
-                
+                vector_results = self.vector_store.search(query, limit * 3 if tags else limit)
+
                 # Convert to standard format
                 results = []
                 for result in vector_results:
@@ -92,9 +120,11 @@ class SQLiteMemoryAPI:
                         "metadata": result["metadata"],
                         "score": result.get("score", 0)
                     })
-                
+
                 if results:
-                    # Vector search found results
+                    # If tags filter requested, apply it by looking up tags from DB
+                    if tags:
+                        results = self._filter_by_tags(results, tags, limit)
                     return results
                 else:
                     # Vector search returned no results, falling back to text search
@@ -102,81 +132,185 @@ class SQLiteMemoryAPI:
             except Exception as e:
                 # Vector search failed, falling back to text search
                 pass
-        
+
         # Fall back to text search
-        # Performing text search
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        
-        cursor.execute(
-            "SELECT id, content, metadata FROM memories WHERE content LIKE ? ORDER BY updated_at DESC LIMIT ?",
-            (f"%{query}%", limit)
-        )
-        
-        results = []
-        for row in cursor.fetchall():
-            results.append({
-                "id": row["id"],
-                "content": row["content"],
-                "metadata": json.loads(row["metadata"])
-            })
-        
+
+        if tags:
+            # Build tag filter: all provided tags must be present
+            # We fetch more rows and filter in Python since SQLite JSON support is limited
+            cursor.execute(
+                "SELECT id, content, tags, metadata FROM memories ORDER BY updated_at DESC LIMIT ?",
+                (limit * 10,)
+            )
+            results = []
+            for row in cursor.fetchall():
+                row_tags = json.loads(row["tags"])
+                if all(t in row_tags for t in tags):
+                    entry = {
+                        "id": row["id"],
+                        "content": row["content"],
+                        "tags": row_tags,
+                        "metadata": json.loads(row["metadata"])
+                    }
+                    # If there's also a query, check content match
+                    if query and query.lower() not in row["content"].lower():
+                        continue
+                    results.append(entry)
+                    if len(results) >= limit:
+                        break
+        else:
+            cursor.execute(
+                "SELECT id, content, tags, metadata FROM memories WHERE content LIKE ? ORDER BY updated_at DESC LIMIT ?",
+                (f"%{query}%", limit)
+            )
+            results = []
+            for row in cursor.fetchall():
+                results.append({
+                    "id": row["id"],
+                    "content": row["content"],
+                    "tags": json.loads(row["tags"]),
+                    "metadata": json.loads(row["metadata"])
+                })
+
         conn.close()
-        # Text search found results
         return results
-    
-    def update_memory(self, memory_id: str, content: str = None, metadata: Dict[str, Any] = None) -> bool:
-        """Update an existing memory chunk."""
+
+    def _filter_by_tags(self, results: List[Dict[str, Any]], tags: List[str],
+                        limit: int) -> List[Dict[str, Any]]:
+        """Filter vector search results by tags, looking up tags from the database."""
+        if not results:
+            return results
+
+        ids = [r["id"] for r in results]
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        placeholders = ",".join("?" for _ in ids)
+        cursor.execute(
+            f"SELECT id, tags FROM memories WHERE id IN ({placeholders})", ids
+        )
+
+        tag_map = {}
+        for row in cursor.fetchall():
+            tag_map[row["id"]] = json.loads(row["tags"])
+        conn.close()
+
+        filtered = []
+        for r in results:
+            row_tags = tag_map.get(r["id"], [])
+            if all(t in row_tags for t in tags):
+                r["tags"] = row_tags
+                filtered.append(r)
+                if len(filtered) >= limit:
+                    break
+        return filtered
+
+    def update_memory(self, memory_id: str, content: str = None,
+                      metadata: Dict[str, Any] = None, tags: List[str] = None) -> bool:
+        """Update an existing memory chunk. Snapshots the old version for rollback."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         # Get current memory
-        cursor.execute("SELECT content, metadata FROM memories WHERE id = ?", (memory_id,))
+        cursor.execute("SELECT content, tags, metadata FROM memories WHERE id = ?", (memory_id,))
         result = cursor.fetchone()
-        
+
         if not result:
             conn.close()
             return False
-        
-        current_content, current_metadata_str = result
+
+        current_content, current_tags_str, current_metadata_str = result
         current_metadata = json.loads(current_metadata_str)
-        
+        current_tags = json.loads(current_tags_str)
+
+        # Snapshot current state to version history
+        cursor.execute(
+            "INSERT INTO memory_versions (memory_id, content, tags, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+            (memory_id, current_content, current_tags_str, current_metadata_str, time.time())
+        )
+
         # Update content if provided
-        if content is not None:
-            new_content = content
-        else:
-            new_content = current_content
-        
+        new_content = content if content is not None else current_content
+
+        # Update tags if provided
+        new_tags = tags if tags is not None else current_tags
+
         # Update metadata if provided
         if metadata is not None:
             new_metadata = current_metadata.copy()
             new_metadata.update(metadata)
         else:
             new_metadata = current_metadata
-        
+
         # Always update the updated_at timestamp
         new_metadata["updated_at"] = time.time()
-        
+
         cursor.execute(
-            "UPDATE memories SET content = ?, metadata = ?, updated_at = ? WHERE id = ?",
-            (new_content, json.dumps(new_metadata), new_metadata["updated_at"], memory_id)
+            "UPDATE memories SET content = ?, tags = ?, metadata = ?, updated_at = ? WHERE id = ?",
+            (new_content, json.dumps(new_tags), json.dumps(new_metadata), new_metadata["updated_at"], memory_id)
         )
-        
+
         conn.commit()
         conn.close()
-        
+
         # Update vector store if available
         if self.vector_store:
             try:
                 if content is not None:
-                    # If content changed, update the embeddings
                     self.vector_store.update_text(memory_id, content, new_metadata)
                 elif metadata is not None:
-                    # If only metadata changed, just update metadata
                     self.vector_store.update_text(memory_id, None, new_metadata)
-                # Updated memory in vector store
             except Exception as e:
                 pass  # Silently handle vector store update errors
-        
+
+        return True
+
+    def rollback_memory(self, memory_id: str) -> bool:
+        """Rollback a memory to its previous version."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        # Check memory exists
+        cursor.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,))
+        if not cursor.fetchone():
+            conn.close()
+            return False
+
+        # Get most recent version
+        cursor.execute(
+            "SELECT version_id, content, tags, metadata FROM memory_versions WHERE memory_id = ? ORDER BY version_id DESC LIMIT 1",
+            (memory_id,)
+        )
+        version = cursor.fetchone()
+        if not version:
+            conn.close()
+            return False
+
+        version_id, old_content, old_tags_str, old_metadata_str = version
+        old_metadata = json.loads(old_metadata_str)
+        old_metadata["updated_at"] = time.time()
+
+        # Restore the old version
+        cursor.execute(
+            "UPDATE memories SET content = ?, tags = ?, metadata = ?, updated_at = ? WHERE id = ?",
+            (old_content, old_tags_str, json.dumps(old_metadata), old_metadata["updated_at"], memory_id)
+        )
+
+        # Remove the consumed version entry
+        cursor.execute("DELETE FROM memory_versions WHERE version_id = ?", (version_id,))
+
+        conn.commit()
+        conn.close()
+
+        # Update vector store if available
+        if self.vector_store:
+            try:
+                self.vector_store.update_text(memory_id, old_content, old_metadata)
+            except Exception as e:
+                pass
+
         return True
