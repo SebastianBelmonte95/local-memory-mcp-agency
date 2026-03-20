@@ -9,7 +9,7 @@ with patch("requests.get", side_effect=ConnectionError("mocked")):
     import sqlite_memory_server
     from sqlite_memory_server import (
         checkpoint, remember, recall, rollback, rollback_memory as rollback_memory_tool,
-        search, list_checkpoints,
+        search, list_checkpoints, purge_expired, consolidate_memories,
         store_memory, update_memory, search_memories,
         get_memories, summarize_memories,
     )
@@ -32,20 +32,27 @@ class TestRememberTool:
         mock_api.store_memory.return_value = "mem_123"
         result = remember("test content")
         assert result == "mem_123"
-        mock_api.store_memory.assert_called_once_with("test content", {}, tags=None)
+        mock_api.store_memory.assert_called_once_with("test content", {}, tags=None, ttl_seconds=None)
 
     def test_with_tags(self, mock_api):
         mock_api.store_memory.return_value = "mem_456"
         remember("content", tags=["agent-a", "project-x"])
         mock_api.store_memory.assert_called_once_with(
-            "content", {}, tags=["agent-a", "project-x"]
+            "content", {}, tags=["agent-a", "project-x"], ttl_seconds=None
         )
 
     def test_with_all_params(self, mock_api):
         mock_api.store_memory.return_value = "mem_789"
         remember("content", tags=["t"], source="meeting", importance=0.9)
         mock_api.store_memory.assert_called_once_with(
-            "content", {"source": "meeting", "importance": 0.9}, tags=["t"]
+            "content", {"source": "meeting", "importance": 0.9}, tags=["t"], ttl_seconds=None
+        )
+
+    def test_with_ttl(self, mock_api):
+        mock_api.store_memory.return_value = "mem_101"
+        remember("meeting at 3pm Tuesday", ttl_seconds=259200)
+        mock_api.store_memory.assert_called_once_with(
+            "meeting at 3pm Tuesday", {}, tags=None, ttl_seconds=259200
         )
 
 
@@ -134,6 +141,34 @@ class TestListCheckpointsTool:
     def test_empty(self, mock_api):
         mock_api.list_checkpoints.return_value = []
         assert list_checkpoints() == []
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestPurgeExpiredTool:
+    def test_purges(self, mock_api):
+        mock_api.purge_expired.return_value = 3
+        assert purge_expired() == 3
+        mock_api.purge_expired.assert_called_once()
+
+    def test_nothing_to_purge(self, mock_api):
+        mock_api.purge_expired.return_value = 0
+        assert purge_expired() == 0
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestConsolidateMemoriesTool:
+    def test_calls_api(self, mock_api):
+        mock_api.consolidate_memories.return_value = ["mem_summary"]
+        with patch.object(sqlite_memory_server, "ollama_available", True):
+            result = consolidate_memories(["tag-a"])
+        assert result == ["mem_summary"]
+
+    def test_returns_empty_when_ollama_unavailable(self, mock_api):
+        with patch.object(sqlite_memory_server, "ollama_available", False):
+            result = consolidate_memories(["tag-a"])
+        assert result == []
 
 
 @pytest.mark.unit

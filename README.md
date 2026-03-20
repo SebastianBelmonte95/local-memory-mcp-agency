@@ -163,6 +163,19 @@ List available checkpoints for a domain.
 - `list_checkpoints(domain?)`
 - Returns checkpoints ordered newest first
 
+#### `purge_expired`
+Delete all expired memories (those past their TTL).
+- `purge_expired(domain?)`
+- **Use case**: Periodic cleanup of temporal memories, triggered manually or via cron
+
+#### `consolidate_memories`
+Compress old memories matching tags into LLM-generated summaries.
+- `consolidate_memories(tags, older_than_days?, domain?)`
+- Originals are deleted, summaries preserve key decisions and outcomes
+- Summaries tagged with `["consolidated"]` and carry `consolidated_from` audit trail
+- **Use case**: Project milestone reached, compress 50 sprint notes into 3 summaries
+- **Warning**: Lossy compression — granular details (URLs, error codes) may not survive
+
 #### `search`
 Find specific memories across sessions and agents using semantic or text search.
 - `search(query, domain?, limit?, use_vector?)`
@@ -568,7 +581,10 @@ list_memory_domains()  // Returns: ["default", "startup", "health"]
 ### Common Environment Variables
 - `OLLAMA_API_URL`: Ollama endpoint (default: `http://localhost:11434`)
 - `OLLAMA_EMBEDDING_MODEL`: Model name (default: `nomic-embed-text`)
+- `OLLAMA_CHAT_MODEL`: Chat model for consolidation summaries (default: `llama3`)
 - `MCP_SERVER_NAME`: Server name for MCP (default: `Local Context Memory`)
+- `MAX_VERSIONS_PER_MEMORY`: Version history cap per memory (default: `20`)
+- `CHECKPOINT_RETENTION_DAYS`: Auto-delete checkpoints older than this (default: `30`)
 
 ### SQLite Specific
 - `MCP_DATA_DIR`: Data storage path (default: `./data`)
@@ -580,6 +596,25 @@ list_memory_domains()  // Returns: ["default", "startup", "health"]
 - `POSTGRES_USER`: Database user (default: `postgres`)
 - `POSTGRES_PASSWORD`: Database password (required)
 - `DEFAULT_MEMORY_DOMAIN`: Default domain for memories (default: `default`)
+
+## Memory Lifecycle
+
+Memories grow over time. Three strategies manage this:
+
+**TTL Expiration** — for inherently temporal memories (meeting times, sprint status, workarounds):
+```javascript
+remember("Meeting moved to 3pm Tuesday", ["team"], ttl_seconds=259200)  // expires in 3 days
+purge_expired()  // clean up after expiry
+```
+
+**Consolidation** — for valuable but numerous memories (project decisions, architecture notes):
+```javascript
+// At a project milestone, compress 50 sprint notes into summaries
+consolidate_memories(["retroboard"], older_than_days=30)
+// Originals deleted, summaries tagged ["retroboard", "consolidated"]
+```
+
+**Neither** — for permanently critical memories (compliance requirements, security constraints, core preferences). Just store them normally without TTL.
 
 ## Development
 

@@ -10,7 +10,7 @@ with patch("requests.get", side_effect=ConnectionError("mocked")), \
     from postgres_memory_server import (
         checkpoint, remember, recall, rollback,
         rollback_memory as rollback_memory_tool,
-        search, list_checkpoints,
+        search, list_checkpoints, purge_expired, consolidate_memories,
         store_memory, update_memory, search_memories,
         get_memories, list_memory_domains, summarize_memories,
     )
@@ -33,20 +33,27 @@ class TestRememberTool:
         mock_api.store_memory.return_value = "mem_123"
         result = remember("test content")
         assert result == "mem_123"
-        mock_api.store_memory.assert_called_once_with("test content", {}, None, tags=None)
+        mock_api.store_memory.assert_called_once_with("test content", {}, None, tags=None, ttl_seconds=None)
 
     def test_with_tags(self, mock_api):
         mock_api.store_memory.return_value = "mem_456"
         remember("content", tags=["agent-a", "project-x"])
         mock_api.store_memory.assert_called_once_with(
-            "content", {}, None, tags=["agent-a", "project-x"]
+            "content", {}, None, tags=["agent-a", "project-x"], ttl_seconds=None
         )
 
     def test_with_all_params(self, mock_api):
         mock_api.store_memory.return_value = "mem_789"
         remember("content", tags=["t"], domain="startup", source="meeting", importance=0.9)
         mock_api.store_memory.assert_called_once_with(
-            "content", {"source": "meeting", "importance": 0.9}, "startup", tags=["t"]
+            "content", {"source": "meeting", "importance": 0.9}, "startup", tags=["t"], ttl_seconds=None
+        )
+
+    def test_with_ttl(self, mock_api):
+        mock_api.store_memory.return_value = "mem_101"
+        remember("meeting at 3pm", ttl_seconds=86400, domain="work")
+        mock_api.store_memory.assert_called_once_with(
+            "meeting at 3pm", {}, "work", tags=None, ttl_seconds=86400
         )
 
 
@@ -144,6 +151,40 @@ class TestListCheckpointsTool:
         mock_api.list_checkpoints.return_value = []
         list_checkpoints(domain="health")
         mock_api.list_checkpoints.assert_called_once_with("health")
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestPurgeExpiredTool:
+    def test_purges(self, mock_api):
+        mock_api.purge_expired.return_value = 3
+        assert purge_expired() == 3
+        mock_api.purge_expired.assert_called_once_with(None)
+
+    def test_with_domain(self, mock_api):
+        mock_api.purge_expired.return_value = 0
+        purge_expired(domain="health")
+        mock_api.purge_expired.assert_called_once_with("health")
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestConsolidateMemoriesTool:
+    def test_calls_api(self, mock_api):
+        mock_api.consolidate_memories.return_value = ["mem_summary"]
+        with patch.object(postgres_memory_server, "ollama_available", True):
+            result = consolidate_memories(["tag-a"])
+        assert result == ["mem_summary"]
+
+    def test_returns_empty_when_ollama_unavailable(self, mock_api):
+        with patch.object(postgres_memory_server, "ollama_available", False):
+            result = consolidate_memories(["tag-a"])
+        assert result == []
+
+    def test_with_domain(self, mock_api):
+        mock_api.consolidate_memories.return_value = ["mem_summary"]
+        with patch.object(postgres_memory_server, "ollama_available", True):
+            consolidate_memories(["tag-a"], domain="health")
 
 
 @pytest.mark.unit

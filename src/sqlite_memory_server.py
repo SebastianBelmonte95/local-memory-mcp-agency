@@ -61,12 +61,14 @@ memory_api = SQLiteMemoryAPI(vector_store=vector_store)
 
 @mcp.tool
 def remember(content: str, tags: Optional[List[str]] = None,
-             source: Optional[str] = None, importance: Optional[float] = None) -> str:
+             source: Optional[str] = None, importance: Optional[float] = None,
+             ttl_seconds: Optional[int] = None) -> str:
     """
     Store a decision, deliverable, or context snapshot with tags for later recall.
 
     Use this whenever you make a key decision, complete a deliverable, or want to
-    preserve context for future sessions or other agents.
+    preserve context for future sessions or other agents. For risky multi-step changes,
+    create a checkpoint first so you can rollback atomically if needed.
 
     Parameters:
     - content (str): What to remember. Include enough context that a future session
@@ -76,6 +78,9 @@ def remember(content: str, tags: Optional[List[str]] = None,
                                   Examples: ["backend-architect", "retroboard", "api-spec"]
     - source (str, optional): Where this memory originated from.
     - importance (float, optional): Importance score from 0.0 to 1.0.
+    - ttl_seconds (int, optional): Time-to-live in seconds. Memory auto-expires after this
+                                   duration. Use for temporal info (meetings, sprint status).
+                                   Omit for permanent memories.
 
     Returns:
     str: A unique memory ID for referencing this memory later.
@@ -86,7 +91,7 @@ def remember(content: str, tags: Optional[List[str]] = None,
     if importance is not None:
         metadata["importance"] = importance
 
-    memory_id = memory_api.store_memory(content, metadata, tags=tags)
+    memory_id = memory_api.store_memory(content, metadata, tags=tags, ttl_seconds=ttl_seconds)
     return memory_id
 
 
@@ -183,6 +188,55 @@ def list_checkpoints() -> List[Dict[str, Any]]:
     List[Dict]: Checkpoints with id, name, tags, and created_at.
     """
     return memory_api.list_checkpoints()
+
+
+@mcp.tool
+def purge_expired() -> int:
+    """
+    Delete all expired memories (those past their TTL).
+
+    Returns:
+    int: Number of memories deleted.
+    """
+    return memory_api.purge_expired()
+
+
+@mcp.tool
+def consolidate_memories(tags: List[str], older_than_days: Optional[int] = 30) -> List[str]:
+    """
+    Compress old memories matching tags into LLM-generated summaries.
+
+    The originals are deleted and replaced with summaries that preserve key
+    decisions, constraints, and outcomes. Use at project milestones to reduce noise.
+
+    This is lossy compression — granular details (exact URLs, error codes) may not
+    survive the summary. For permanently critical memories, do not consolidate.
+
+    Parameters:
+    - tags (List[str]): Filter to memories matching ALL of these tags.
+    - older_than_days (int, optional): Only consolidate memories older than this (default: 30).
+
+    Returns:
+    List[str]: IDs of new summary memories, or empty list if too few memories to consolidate.
+    """
+    if not ollama_available:
+        return []
+
+    def _summarize(text: str) -> str:  # pragma: no cover
+        import requests as req
+        response = req.post(
+            f"{ollama_url}/api/generate",
+            json={
+                "model": os.environ.get("OLLAMA_CHAT_MODEL", "llama3"),
+                "prompt": f"Summarize these memories into a concise summary preserving key decisions, constraints, and outcomes:\n\n{text}\n\nSummary:",
+                "stream": False,
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        return response.json()["response"]
+
+    return memory_api.consolidate_memories(tags, _summarize, older_than_days=older_than_days)
 
 
 @mcp.tool

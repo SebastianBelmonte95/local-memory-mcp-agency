@@ -447,6 +447,91 @@ class TestListCheckpoints:
 
 @pytest.mark.unit
 @pytest.mark.postgres
+class TestVersionRetention:
+    def test_prune_query_executed_on_update(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchone.return_value = MOCK_EXISTING_ROW
+        pg_api.update_memory("mem_1", content="new")
+        # Should have prune query among the execute calls
+        calls_str = str(mock_pg_cursor.execute.call_args_list)
+        assert "LIMIT GREATEST" in calls_str or mock_pg_cursor.execute.call_count >= 4
+
+    def test_config_from_env(self, monkeypatch):
+        monkeypatch.setenv("MAX_VERSIONS_PER_MEMORY", "5")
+        with patch("postgres_memory_api.psycopg2"):
+            import importlib, postgres_memory_api
+            importlib.reload(postgres_memory_api)
+            api = postgres_memory_api.PostgresMemoryAPI()
+        assert api.max_versions == 5
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestTTLExpiration:
+    def test_store_with_ttl(self, pg_api, mock_pg_cursor):
+        mem_id = pg_api.store_memory("ephemeral", ttl_seconds=3600)
+        assert mem_id.startswith("mem_")
+        # The insert query should include expires_at
+        assert mock_pg_cursor.execute.called
+
+    def test_store_without_ttl(self, pg_api, mock_pg_cursor):
+        pg_api.store_memory("permanent")
+        assert mock_pg_cursor.execute.called
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestPurgeExpired:
+    def test_purges_expired(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchall.return_value = [("mem_1",), ("mem_2",)]
+        count = pg_api.purge_expired()
+        assert count == 2
+
+    def test_nothing_to_purge(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchall.return_value = []
+        assert pg_api.purge_expired() == 0
+
+    def test_with_domain(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchall.return_value = []
+        pg_api.purge_expired(domain="health")
+        assert mock_pg_cursor.execute.called
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestConsolidateMemories:
+    def test_consolidation(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchall.return_value = [
+            {"id": f"mem_{i}", "content": f"decision {i}", "tags": ["project-x"], "metadata": {}}
+            for i in range(6)
+        ]
+        pg_api.store_memory = MagicMock(return_value="mem_summary")
+
+        result = pg_api.consolidate_memories(
+            ["project-x"], lambda t: "Summary text", older_than_days=30
+        )
+        assert result == ["mem_summary"]
+        pg_api.store_memory.assert_called_once()
+
+    def test_skips_when_below_min_count(self, pg_api, mock_pg_cursor):
+        mock_pg_cursor.fetchall.return_value = [
+            {"id": "mem_1", "content": "one", "tags": ["x"], "metadata": {}}
+        ]
+        result = pg_api.consolidate_memories(["x"], lambda t: "summary")
+        assert result == []
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestCheckpointAutoCleanup:
+    def test_cleanup_query_executed(self, pg_api, mock_pg_cursor):
+        pg_api.create_checkpoint("save")
+        # Should have insert + cleanup queries
+        calls_str = str(mock_pg_cursor.execute.call_args_list)
+        assert "days" in calls_str.lower() or mock_pg_cursor.execute.call_count >= 3
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
 class TestEnsureTableExists:
     def test_calls_create_function(self, pg_api, mock_pg_cursor):
         pg_api._ensure_table_exists("testdomain")

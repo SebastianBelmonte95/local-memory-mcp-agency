@@ -109,3 +109,103 @@ This way the agency-agents contract (`remember`, `recall`, `rollback`, `search`)
 - [x] **6.5.1** CLAUDE.md updated with checkpoint tools and revised rollback
 - [x] **6.5.2** README.md agency-agents integration section updated with checkpoint workflow
 - [x] **6.5.3** README.md tools section updated: `checkpoint`, `rollback`, `rollback_memory`, `list_checkpoints`
+
+---
+
+## Phase 7: Memory Lifecycle Management (unbounded growth)
+
+**Problem:** Memory tables, version history, and checkpoints grow indefinitely. A long-lived
+project with many agents, frequent updates, and regular checkpointing will accumulate data
+that degrades search quality (signal drowns in noise) and consumes storage. There is no
+pruning, consolidation, expiration, or archival mechanism.
+
+Three distinct sub-problems:
+
+1. **Version bloat** — Every `update_memory` creates a version snapshot. A memory updated
+   50 times has 50 historical rows. After a successful checkpoint rollback, orphaned versions
+   are cleaned up, but versions from normal (non-rolled-back) updates accumulate forever.
+
+2. **Stale memories** — Memories stored months ago for a project that's long finished still
+   appear in search results. Low-importance memories from casual conversations compete with
+   high-importance current decisions.
+
+3. **Checkpoint accumulation** — Checkpoints that were never rolled back linger. They're small
+   (just a row with a timestamp), but they add noise to `list_checkpoints` output and signal
+   that no one is cleaning up.
+
+**Solution:** A three-layer retention system, each layer independently useful:
+
+**Layer 1 — Version retention policy:** Cap the number of version snapshots per memory. When
+a new version is created and the count exceeds the limit, delete the oldest. Default: 20
+versions per memory. This bounds the version table to `N_memories * 20` rows maximum.
+
+**Layer 2 — TTL expiration for temporal memories:** Memories with a natural expiration
+(meeting times, sprint status, temporary workarounds) get an optional `expires_at` field.
+A `purge_expired` method deletes them after expiry. Memories without `expires_at` live
+forever (the default, preserving current behavior). This targets memories that the agent
+*can* predict are ephemeral at store time.
+
+**Layer 3 — Consolidation summaries for accumulated context:** Memories that are valuable
+but accumulating (project decisions, architecture choices, client preferences) shouldn't
+expire — but 50 of them should eventually become 5 summaries. An agent or human explicitly
+triggers `consolidate_memories()` at a project milestone. An LLM reads the batch and
+produces summary memories that preserve key decisions, constraints, and outcomes. The
+originals are then deleted. Information survives in compressed form; storage and search
+noise are reduced. This is lossy compression — granular details (exact URLs, error codes)
+may not survive, but the narrative and decision rationale do.
+
+**When to use which:**
+- **TTL** for *inherently temporal* memories: "meeting moved to 3pm Tuesday", "deploy is
+  blocked on CI fix", "use workaround X until patch ships". These have a natural shelf life.
+- **Consolidation** for *valuable but numerous* memories: project architecture decisions,
+  client preferences, sprint retrospective notes. These shouldn't expire, but they should
+  eventually be compressed.
+- **Neither** for *permanently critical* memories: compliance requirements, security
+  constraints, core user preferences. These stay as-is forever.
+
+**Layer 4 — Checkpoint auto-cleanup:** Checkpoints older than a configurable age are
+automatically deleted during `create_checkpoint` (e.g., delete checkpoints older than 7 days,
+except the most recent checkpoint). This keeps the checkpoint list manageable without
+requiring manual cleanup.
+
+### Phase 7.1: Version Retention Policy — DONE
+
+- [x] **7.1.1** `MAX_VERSIONS_PER_MEMORY` config (default: 20, env var)
+- [x] **7.1.2** SQLite auto-prune oldest versions on update
+- [x] **7.1.3** PostgreSQL auto-prune oldest versions on update
+- [x] **7.1.4** Tests: limit exceeded, limit=1, env var config
+
+### Phase 7.2: TTL Expiration — DONE
+
+- [x] **7.2.1** `expires_at` column on both schemas + SQLite migration
+- [x] **7.2.2** `store_memory()` accepts `ttl_seconds` on both APIs
+- [x] **7.2.3** `purge_expired()` on both APIs (deletes + cleans versions)
+- [x] **7.2.4** `purge_expired` MCP tool on both servers
+- [x] **7.2.5** Expired memories filtered from all search paths
+- [x] **7.2.6** `remember` tool accepts `ttl_seconds`
+- [x] **7.2.7** SQLite migration for `expires_at`
+- [x] **7.2.8** Tests: TTL storage, expiry filtering, purge, migration, NULL = permanent
+
+### Phase 7.3: Consolidation Summaries — DONE
+
+- [x] **7.3.1** `consolidate_memories()` on both APIs (pluggable `summarizer_fn`)
+- [x] **7.3.2** LLM interface: callable parameter, servers use Ollama generate endpoint
+- [x] **7.3.3** `consolidate_memories` MCP tool on both servers
+- [x] **7.3.4** Summaries tagged `["consolidated"]` with `consolidated_from` metadata
+- [x] **7.3.5** Tests: consolidation lifecycle, originals deleted, metadata correct, skip below threshold
+- [x] **7.3.6** Tests: mock summarizer_fn (no real LLM calls)
+
+### Phase 7.4: Checkpoint Auto-Cleanup — DONE
+
+- [x] **7.4.1** `CHECKPOINT_RETENTION_DAYS` config (default: 30, env var)
+- [x] **7.4.2** Auto-prune old checkpoints on `create_checkpoint`, most recent always kept
+- [x] **7.4.3** Tests: old pruned, recent kept, config override
+
+### Phase 7.5: Tests & Documentation — DONE
+
+- [x] **7.5.1** Version retention tests under heavy updates
+- [x] **7.5.2** TTL expiration lifecycle tests
+- [x] **7.5.3** Consolidation lifecycle tests
+- [x] **7.5.4** 100% coverage maintained (263 tests, 973 statements, 0 misses)
+- [x] **7.5.5** CLAUDE.md: lifecycle management section with decision guide
+- [x] **7.5.6** README.md: new env vars, tools, Memory Lifecycle section with examples

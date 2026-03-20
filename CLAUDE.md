@@ -64,22 +64,31 @@ Key design decisions:
 ## MCP Interface
 
 **Agency-Agents compatible tools** (primary interface):
-- `remember(content, tags?, source?, importance?, domain?)` — store decisions/deliverables with tags
+- `remember(content, tags?, source?, importance?, ttl_seconds?, domain?)` — store decisions/deliverables with tags. Optional TTL for temporal memories.
 - `recall(tags?, query?, domain?, limit?)` — retrieve by tag filter and/or semantic search
 - `checkpoint(name, tags?, domain?)` — create a named save point before risky work
 - `rollback(checkpoint_id, domain?)` — atomically undo all changes made after a checkpoint (deletes new memories, restores updated ones)
 - `rollback_memory(memory_id, domain?)` — revert a single memory to its previous version (per-memory, stack-based)
 - `search(query, domain?, limit?)` — broad semantic/text search across all memories
 - `list_checkpoints(domain?)` — list available checkpoints
+- `purge_expired(domain?)` — delete memories past their TTL
+- `consolidate_memories(tags, older_than_days?, domain?)` — LLM-compress old memories into summaries
 
 **Legacy tools** (kept for backward compatibility):
 - `store_memory`, `update_memory`, `search_memories`
 
 Both versions also expose: `summarize_memories` prompt, `memory://` resource URI scheme. PostgreSQL additionally exposes `list_memory_domains`.
 
-**Tags** are the primary organizational mechanism — use agent name, project name, and topic (e.g., `["backend-architect", "retroboard", "api-spec"]`). `recall` filters by ALL provided tags (AND logic).
+**Tags** are the primary organizational mechanism — use agent name, project name, and topic (e.g., `["backend-architect", "retroboard", "api-spec"]`). Tags are auto-normalized to lowercase+stripped. `recall` filters by ALL provided tags (AND logic).
 
 **Checkpoints** enable atomic multi-memory rollback. `checkpoint()` creates a named save point; `rollback()` undoes everything after it — deleting new memories and restoring updated ones. For single-memory rollback, use `rollback_memory()` which pops one version from the history stack.
+
+**Memory Lifecycle Management:**
+- **Version retention:** Capped at `MAX_VERSIONS_PER_MEMORY` (default: 20, env var). Oldest versions pruned automatically on update.
+- **TTL expiration:** `remember(..., ttl_seconds=N)` sets auto-expiry. Expired memories are filtered from search results. `purge_expired` physically deletes them. Use for temporal info (meeting times, sprint status). Omit TTL for permanent memories.
+- **Consolidation:** `consolidate_memories(tags, older_than_days)` uses an LLM to compress old memories into summaries. Originals deleted, summaries tagged with `["consolidated"]` and carry `consolidated_from` metadata. Use at project milestones. Lossy — specific values may not survive.
+- **Checkpoint auto-cleanup:** Old checkpoints beyond `CHECKPOINT_RETENTION_DAYS` (default: 30, env var) are pruned when new checkpoints are created. Most recent is always kept.
+- **When to use which:** TTL for inherently temporal memories. Consolidation for valuable-but-numerous project context. Neither for permanently critical memories (compliance, security, core preferences).
 
 ## Configuration
 

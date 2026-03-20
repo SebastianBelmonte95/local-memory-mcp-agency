@@ -6,6 +6,11 @@ import pathlib
 from typing import List, Dict, Any, Optional
 from sqlite_vector_api import FAISSVectorAPI
 
+def _normalize_tags(tags: List[str]) -> List[str]:
+    """Normalize tags to lowercase and stripped whitespace for consistent matching."""
+    return [t.strip().lower() for t in tags] if tags else []
+
+
 class SQLiteMemoryAPI:
     def __init__(self, db_path: str = None, vector_store: FAISSVectorAPI = None):
         # Set default path or use provided path
@@ -15,6 +20,9 @@ class SQLiteMemoryAPI:
             self.db_path = os.path.join(data_dir, "memory.db")
         else:
             self.db_path = db_path
+
+        self.max_versions = int(os.environ.get("MAX_VERSIONS_PER_MEMORY", "20"))
+        self.checkpoint_retention_days = int(os.environ.get("CHECKPOINT_RETENTION_DAYS", "30"))
 
         self._initialize_db()
 
@@ -34,7 +42,8 @@ class SQLiteMemoryAPI:
             tags TEXT NOT NULL DEFAULT '[]',
             metadata TEXT NOT NULL,
             created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
+            updated_at REAL NOT NULL,
+            expires_at REAL DEFAULT NULL
         )
         ''')
 
@@ -65,21 +74,24 @@ class SQLiteMemoryAPI:
         )
         ''')
 
-        # Migration: add tags column to existing databases that lack it
+        # Migrations for existing databases
         cursor.execute("PRAGMA table_info(memories)")
         columns = [row[1] for row in cursor.fetchall()]
         if "tags" not in columns:
             cursor.execute("ALTER TABLE memories ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
+        if "expires_at" not in columns:
+            cursor.execute("ALTER TABLE memories ADD COLUMN expires_at REAL DEFAULT NULL")
 
         conn.commit()
         conn.close()
 
     def store_memory(self, content: str, metadata: Dict[str, Any] = None,
-                     tags: List[str] = None) -> str:
+                     tags: List[str] = None, ttl_seconds: int = None) -> str:
         """Store a new memory chunk in the database."""
         memory_id = f"mem_{int(time.time() * 1000)}"
         timestamp = time.time()
-        tags = tags or []
+        tags = _normalize_tags(tags)
+        expires_at = (timestamp + ttl_seconds) if ttl_seconds else None
 
         metadata = metadata or {}
         metadata.update({
@@ -91,8 +103,8 @@ class SQLiteMemoryAPI:
         cursor = conn.cursor()
 
         cursor.execute(
-            "INSERT INTO memories (id, content, tags, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (memory_id, content, json.dumps(tags), json.dumps(metadata), timestamp, timestamp)
+            "INSERT INTO memories (id, content, tags, metadata, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (memory_id, content, json.dumps(tags), json.dumps(metadata), timestamp, timestamp, expires_at)
         )
 
         conn.commit()
@@ -115,6 +127,7 @@ class SQLiteMemoryAPI:
         Otherwise, fall back to SQL text search.
         When tags are provided, filter results to only include memories matching ALL tags.
         """
+        tags = _normalize_tags(tags) if tags else None
         # Try vector search first if available and requested
         if self.vector_store and use_vector:
             try:
@@ -148,12 +161,13 @@ class SQLiteMemoryAPI:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
+        now = time.time()
         if tags:
             # Build tag filter: all provided tags must be present
             # We fetch more rows and filter in Python since SQLite JSON support is limited
             cursor.execute(
-                "SELECT id, content, tags, metadata FROM memories ORDER BY updated_at DESC LIMIT ?",
-                (limit * 10,)
+                "SELECT id, content, tags, metadata FROM memories WHERE (expires_at IS NULL OR expires_at > ?) ORDER BY updated_at DESC LIMIT ?",
+                (now, limit * 10,)
             )
             results = []
             for row in cursor.fetchall():
@@ -173,8 +187,8 @@ class SQLiteMemoryAPI:
                         break
         else:
             cursor.execute(
-                "SELECT id, content, tags, metadata FROM memories WHERE content LIKE ? ORDER BY updated_at DESC LIMIT ?",
-                (f"%{query}%", limit)
+                "SELECT id, content, tags, metadata FROM memories WHERE content LIKE ? AND (expires_at IS NULL OR expires_at > ?) ORDER BY updated_at DESC LIMIT ?",
+                (f"%{query}%", now, limit)
             )
             results = []
             for row in cursor.fetchall():
@@ -222,6 +236,7 @@ class SQLiteMemoryAPI:
     def update_memory(self, memory_id: str, content: str = None,
                       metadata: Dict[str, Any] = None, tags: List[str] = None) -> bool:
         """Update an existing memory chunk. Snapshots the old version for rollback."""
+        tags = _normalize_tags(tags) if tags is not None else None
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
 
@@ -242,6 +257,19 @@ class SQLiteMemoryAPI:
             "INSERT INTO memory_versions (memory_id, content, tags, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
             (memory_id, current_content, current_tags_str, current_metadata_str, time.time())
         )
+
+        # Prune old versions if exceeding retention limit
+        cursor.execute(
+            "SELECT COUNT(*) FROM memory_versions WHERE memory_id = ?", (memory_id,)
+        )
+        version_count = cursor.fetchone()[0]
+        if version_count > self.max_versions:
+            cursor.execute("""
+                DELETE FROM memory_versions WHERE version_id IN (
+                    SELECT version_id FROM memory_versions
+                    WHERE memory_id = ? ORDER BY version_id ASC LIMIT ?
+                )
+            """, (memory_id, version_count - self.max_versions))
 
         # Update content if provided
         new_content = content if content is not None else current_content
@@ -283,7 +311,7 @@ class SQLiteMemoryAPI:
         """Create a named checkpoint for atomic multi-memory rollback."""
         checkpoint_id = f"chk_{int(time.time() * 1000)}"
         timestamp = time.time()
-        tags = tags or []
+        tags = _normalize_tags(tags)
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -291,6 +319,15 @@ class SQLiteMemoryAPI:
             "INSERT INTO checkpoints (id, name, tags, created_at) VALUES (?, ?, ?, ?)",
             (checkpoint_id, name, json.dumps(tags), timestamp)
         )
+
+        # Auto-cleanup: delete checkpoints older than retention period, except the most recent
+        retention_cutoff = timestamp - (self.checkpoint_retention_days * 86400)
+        cursor.execute("""
+            DELETE FROM checkpoints WHERE created_at < ? AND id != (
+                SELECT id FROM checkpoints ORDER BY created_at DESC LIMIT 1
+            )
+        """, (retention_cutoff,))
+
         conn.commit()
         conn.close()
         return checkpoint_id
@@ -388,6 +425,102 @@ class SQLiteMemoryAPI:
             })
         conn.close()
         return results
+
+    def purge_expired(self) -> int:
+        """Delete all expired memories. Returns count of deleted memories."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        now = time.time()
+
+        # Get IDs of expired memories for cleanup
+        cursor.execute(
+            "SELECT id FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?", (now,)
+        )
+        expired_ids = [r[0] for r in cursor.fetchall()]
+
+        if not expired_ids:
+            conn.close()
+            return 0
+
+        placeholders = ",".join("?" for _ in expired_ids)
+        cursor.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", expired_ids)
+        cursor.execute(f"DELETE FROM memory_versions WHERE memory_id IN ({placeholders})", expired_ids)
+
+        conn.commit()
+        conn.close()
+        return len(expired_ids)
+
+    def consolidate_memories(self, tags: List[str], summarizer_fn,
+                             older_than_days: int = 30,
+                             min_count: int = 5) -> List[str]:
+        """Consolidate old memories matching tags into LLM-generated summaries.
+
+        Args:
+            tags: Filter to memories matching ALL of these tags.
+            summarizer_fn: Callable(str) -> str that takes formatted memories text
+                          and returns a summary string.
+            older_than_days: Only consolidate memories older than this many days.
+            min_count: Skip consolidation if fewer than this many memories match.
+
+        Returns:
+            List of new summary memory IDs, or empty list if skipped.
+        """
+        tags = _normalize_tags(tags)
+        cutoff = time.time() - (older_than_days * 86400)
+
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Find matching memories older than cutoff
+        cursor.execute(
+            "SELECT id, content, tags, metadata FROM memories WHERE created_at < ? ORDER BY created_at ASC",
+            (cutoff,)
+        )
+        matching = []
+        for row in cursor.fetchall():
+            row_tags = json.loads(row["tags"])
+            if all(t in row_tags for t in tags):
+                matching.append({
+                    "id": row["id"],
+                    "content": row["content"],
+                    "tags": row_tags,
+                    "metadata": json.loads(row["metadata"]),
+                })
+
+        if len(matching) < min_count:
+            conn.close()
+            return []
+
+        # Format memories for the summarizer
+        memory_texts = [f"Memory {i+1} (ID: {m['id']}): {m['content']}"
+                        for i, m in enumerate(matching)]
+        formatted = "\n".join(memory_texts)
+
+        # Call the summarizer
+        summary_text = summarizer_fn(formatted)
+
+        conn.close()
+
+        # Store the summary as a new memory
+        original_ids = [m["id"] for m in matching]
+        summary_tags = list(set(tags + ["consolidated"]))
+        summary_metadata = {
+            "consolidated_from": original_ids,
+            "consolidated_count": len(original_ids),
+        }
+        summary_id = self.store_memory(summary_text, summary_metadata, tags=summary_tags)
+
+        # Delete the originals and their version history
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        placeholders = ",".join("?" for _ in original_ids)
+        cursor.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", original_ids)
+        cursor.execute(f"DELETE FROM memory_versions WHERE memory_id IN ({placeholders})", original_ids)
+        conn.commit()
+        conn.close()
+
+        return [summary_id]
 
     def rollback_memory(self, memory_id: str) -> bool:
         """Rollback a memory to its previous version."""

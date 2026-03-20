@@ -82,6 +82,15 @@ class TestStoreMemory:
         assert tags == ["agent-a", "project-x"]
         conn.close()
 
+    def test_tags_normalized_on_store(self, sqlite_memory_api):
+        mem_id = sqlite_memory_api.store_memory("content", tags=["  Backend-Architect ", "RETROBOARD"])
+        conn = sqlite3.connect(sqlite_memory_api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT tags FROM memories WHERE id = ?", (mem_id,))
+        tags = json.loads(cursor.fetchone()[0])
+        assert tags == ["backend-architect", "retroboard"]
+        conn.close()
+
     def test_default_empty_tags(self, sqlite_memory_api):
         mem_id = sqlite_memory_api.store_memory("content")
         conn = sqlite3.connect(sqlite_memory_api.db_path)
@@ -174,6 +183,13 @@ class TestRetrieveMemories:
         results = sqlite_memory_api.retrieve_memories("", tags=["a", "b"])
         assert len(results) == 1
         assert "both tags" in results[0]["content"]
+
+    def test_tags_normalized_on_recall(self, sqlite_memory_api):
+        """Querying with mixed-case tags still matches lowercase-stored tags."""
+        sqlite_memory_api.store_memory("tagged content", tags=["agent-a"])
+        time.sleep(0.002)
+        results = sqlite_memory_api.retrieve_memories("", tags=["  Agent-A  "])
+        assert len(results) == 1
 
     def test_tags_with_query(self, sqlite_memory_api):
         sqlite_memory_api.store_memory("keyword_xyz tagged", tags=["a"])
@@ -585,4 +601,213 @@ class TestCheckpointSchema:
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='checkpoints'")
         assert cursor.fetchone() is not None
+        conn.close()
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestVersionRetention:
+    def test_prunes_oldest_when_exceeding_limit(self, tmp_path):
+        api = SQLiteMemoryAPI(db_path=str(tmp_path / "t.db"))
+        api.max_versions = 3
+        mem_id = api.store_memory("v0")
+        for i in range(5):
+            api.update_memory(mem_id, content=f"v{i+1}")
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM memory_versions WHERE memory_id = ?", (mem_id,))
+        assert cursor.fetchone()[0] == 3
+        conn.close()
+
+    def test_limit_one_keeps_only_most_recent(self, tmp_path):
+        api = SQLiteMemoryAPI(db_path=str(tmp_path / "t.db"))
+        api.max_versions = 1
+        mem_id = api.store_memory("v0")
+        api.update_memory(mem_id, content="v1")
+        api.update_memory(mem_id, content="v2")
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM memory_versions WHERE memory_id = ?", (mem_id,))
+        assert cursor.fetchone()[0] == 1
+        # The kept version should be the most recent snapshot (v1 content)
+        cursor.execute("SELECT content FROM memory_versions WHERE memory_id = ?", (mem_id,))
+        assert cursor.fetchone()[0] == "v1"
+        conn.close()
+
+    def test_default_limit_from_env(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MAX_VERSIONS_PER_MEMORY", "5")
+        api = SQLiteMemoryAPI(db_path=str(tmp_path / "t.db"))
+        assert api.max_versions == 5
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestTTLExpiration:
+    def test_store_with_ttl(self, sqlite_memory_api):
+        mem_id = sqlite_memory_api.store_memory("ephemeral", ttl_seconds=3600)
+        conn = sqlite3.connect(sqlite_memory_api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT expires_at FROM memories WHERE id = ?", (mem_id,))
+        expires_at = cursor.fetchone()[0]
+        assert expires_at is not None
+        assert expires_at > time.time()
+        conn.close()
+
+    def test_store_without_ttl_has_null_expires(self, sqlite_memory_api):
+        mem_id = sqlite_memory_api.store_memory("permanent")
+        conn = sqlite3.connect(sqlite_memory_api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT expires_at FROM memories WHERE id = ?", (mem_id,))
+        assert cursor.fetchone()[0] is None
+        conn.close()
+
+    def test_expired_memories_not_in_search(self, sqlite_memory_api):
+        # Store, then manually set expires_at to the past
+        mem_id = sqlite_memory_api.store_memory("expired_keyword_xyz", ttl_seconds=3600)
+        conn = sqlite3.connect(sqlite_memory_api.db_path)
+        conn.execute("UPDATE memories SET expires_at = ? WHERE id = ?", (time.time() - 10, mem_id))
+        conn.commit()
+        conn.close()
+        results = sqlite_memory_api.retrieve_memories("expired_keyword_xyz")
+        assert not any(r["id"] == mem_id for r in results)
+
+    def test_unexpired_memories_in_search(self, sqlite_memory_api):
+        mem_id = sqlite_memory_api.store_memory("fresh_keyword_xyz", ttl_seconds=99999)
+        results = sqlite_memory_api.retrieve_memories("fresh_keyword_xyz")
+        assert any(r["id"] == mem_id for r in results)
+
+    def test_purge_expired(self, sqlite_memory_api):
+        mem_id = sqlite_memory_api.store_memory("will expire", ttl_seconds=3600)
+        # Manually expire it
+        conn = sqlite3.connect(sqlite_memory_api.db_path)
+        conn.execute("UPDATE memories SET expires_at = ? WHERE id = ?", (time.time() - 10, mem_id))
+        conn.commit()
+        conn.close()
+        sqlite_memory_api.store_memory("stays forever")
+        count = sqlite_memory_api.purge_expired()
+        assert count == 1
+        conn = sqlite3.connect(sqlite_memory_api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM memories")
+        assert cursor.fetchone()[0] == 1
+        conn.close()
+
+    def test_purge_nothing(self, sqlite_memory_api):
+        sqlite_memory_api.store_memory("permanent")
+        assert sqlite_memory_api.purge_expired() == 0
+
+    def test_expires_at_migration(self, tmp_path):
+        """Existing DB without expires_at column gets it via migration."""
+        db_path = str(tmp_path / "old.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("""
+        CREATE TABLE memories (
+            id TEXT PRIMARY KEY, content TEXT NOT NULL,
+            tags TEXT NOT NULL DEFAULT '[]',
+            metadata TEXT NOT NULL, created_at REAL NOT NULL, updated_at REAL NOT NULL
+        )""")
+        conn.commit()
+        conn.close()
+        api = SQLiteMemoryAPI(db_path=db_path)
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(memories)")
+        columns = [row[1] for row in cursor.fetchall()]
+        assert "expires_at" in columns
+        conn.close()
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestConsolidateMemories:
+    def test_consolidation(self, sqlite_memory_api):
+        api = sqlite_memory_api
+        # Store old memories (fake old timestamps)
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        old_time = time.time() - (60 * 86400)  # 60 days ago
+        for i in range(6):
+            cursor.execute(
+                "INSERT INTO memories (id, content, tags, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (f"mem_old_{i}", f"decision {i}", '["project-x"]', '{}', old_time + i, old_time + i)
+            )
+        conn.commit()
+        conn.close()
+
+        def fake_summarizer(text):
+            return f"Summary of {text.count('Memory')} memories"
+
+        result = api.consolidate_memories(["project-x"], fake_summarizer, older_than_days=30)
+        assert len(result) == 1
+
+        # Originals should be deleted
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM memories WHERE id LIKE 'mem_old_%'")
+        assert cursor.fetchone()[0] == 0
+
+        # Summary should exist with consolidated tag and metadata
+        cursor.execute("SELECT content, tags, metadata FROM memories WHERE id = ?", (result[0],))
+        row = cursor.fetchone()
+        assert "Summary" in row[0]
+        tags = json.loads(row[1])
+        assert "consolidated" in tags
+        assert "project-x" in tags
+        meta = json.loads(row[2])
+        assert "consolidated_from" in meta
+        assert len(meta["consolidated_from"]) == 6
+        conn.close()
+
+    def test_skips_when_below_min_count(self, sqlite_memory_api):
+        api = sqlite_memory_api
+        api.store_memory("one memory", tags=["project-x"])
+        result = api.consolidate_memories(["project-x"], lambda t: "summary", older_than_days=0)
+        assert result == []
+
+    def test_skips_recent_memories(self, sqlite_memory_api):
+        api = sqlite_memory_api
+        for i in range(10):
+            api.store_memory(f"recent {i}", tags=["project-x"])
+            time.sleep(0.002)
+        result = api.consolidate_memories(["project-x"], lambda t: "summary", older_than_days=30)
+        assert result == []  # all too recent
+
+
+@pytest.mark.unit
+@pytest.mark.sqlite
+class TestCheckpointAutoCleanup:
+    def test_old_checkpoints_pruned(self, tmp_path):
+        api = SQLiteMemoryAPI(db_path=str(tmp_path / "t.db"))
+        api.checkpoint_retention_days = 0  # everything is "old"
+        # Create an old checkpoint manually
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        old_time = time.time() - 86400
+        cursor.execute("INSERT INTO checkpoints (id, name, tags, created_at) VALUES (?, ?, ?, ?)",
+                       ("chk_old", "old save", "[]", old_time))
+        conn.commit()
+        conn.close()
+
+        # Creating a new checkpoint should prune the old one
+        api.create_checkpoint("new save")
+
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM checkpoints")
+        # Only the new one should remain (old was pruned, but most recent is kept)
+        assert cursor.fetchone()[0] == 1
+        cursor.execute("SELECT name FROM checkpoints")
+        assert cursor.fetchone()[0] == "new save"
+        conn.close()
+
+    def test_recent_checkpoints_kept(self, sqlite_memory_api):
+        api = sqlite_memory_api
+        api.checkpoint_retention_days = 30
+        api.create_checkpoint("first")
+        time.sleep(0.01)
+        api.create_checkpoint("second")
+        conn = sqlite3.connect(api.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM checkpoints")
+        assert cursor.fetchone()[0] == 2
         conn.close()

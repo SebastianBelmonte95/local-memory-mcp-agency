@@ -19,7 +19,8 @@ BEGIN
             tags TEXT[] NOT NULL DEFAULT ''{}''::TEXT[],
             metadata JSONB NOT NULL,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            expires_at TIMESTAMP WITH TIME ZONE DEFAULT NULL
         )', table_name);
 
     -- Create indexes for performance
