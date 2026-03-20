@@ -11,6 +11,7 @@ with patch("requests.get", side_effect=ConnectionError("mocked")), \
         checkpoint, remember, recall, rollback,
         rollback_memory as rollback_memory_tool,
         search, list_checkpoints, purge_expired, consolidate_memories,
+        export_memories, import_memories,
         store_memory, update_memory, search_memories,
         get_memories, list_memory_domains, summarize_memories,
     )
@@ -185,6 +186,38 @@ class TestConsolidateMemoriesTool:
         mock_api.consolidate_memories.return_value = ["mem_summary"]
         with patch.object(postgres_memory_server, "ollama_available", True):
             consolidate_memories(["tag-a"], domain="health")
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestExportMemoriesTool:
+    def test_calls_api(self, mock_api):
+        mock_api.export_memories.return_value = {"version": 1, "memories": []}
+        result = export_memories()
+        assert result["version"] == 1
+        mock_api.export_memories.assert_called_once_with(None)
+
+    def test_with_domain(self, mock_api):
+        mock_api.export_memories.return_value = {"version": 1, "memories": []}
+        export_memories(domain="health")
+        mock_api.export_memories.assert_called_once_with("health")
+
+
+@pytest.mark.unit
+@pytest.mark.postgres
+class TestImportMemoriesTool:
+    def test_calls_api(self, mock_api):
+        mock_api.import_memories.return_value = {"memories": 2, "memory_versions": 0, "checkpoints": 0}
+        data = {"memories": []}
+        result = import_memories(data)
+        assert result["memories"] == 2
+        mock_api.import_memories.assert_called_once_with(data, None)
+
+    def test_with_domain(self, mock_api):
+        mock_api.import_memories.return_value = {"memories": 1, "memory_versions": 0, "checkpoints": 0}
+        data = {"memories": []}
+        import_memories(data, domain="health")
+        mock_api.import_memories.assert_called_once_with(data, "health")
 
 
 @pytest.mark.unit

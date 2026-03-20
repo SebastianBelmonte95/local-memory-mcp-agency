@@ -73,6 +73,8 @@ Key design decisions:
 - `list_checkpoints(domain?)` — list available checkpoints
 - `purge_expired(domain?)` — delete memories past their TTL
 - `consolidate_memories(tags, older_than_days?, domain?)` — LLM-compress old memories into summaries
+- `export_memories(domain?)` — export all memories, versions, checkpoints as portable JSON
+- `import_memories(data, domain?)` — import from export JSON, skips duplicates, regenerates embeddings
 
 **Legacy tools** (kept for backward compatibility):
 - `store_memory`, `update_memory`, `search_memories`

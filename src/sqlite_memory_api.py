@@ -567,3 +567,108 @@ class SQLiteMemoryAPI:
                 pass
 
         return True
+
+    def export_memories(self) -> Dict[str, Any]:
+        """Export all memories, versions, and checkpoints as a portable dict."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT id, content, tags, metadata, created_at, updated_at, expires_at FROM memories")
+        memories = []
+        for row in cursor.fetchall():
+            memories.append({
+                "id": row["id"],
+                "content": row["content"],
+                "tags": json.loads(row["tags"]),
+                "metadata": json.loads(row["metadata"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "expires_at": row["expires_at"],
+            })
+
+        cursor.execute("SELECT version_id, memory_id, content, tags, metadata, created_at FROM memory_versions")
+        versions = []
+        for row in cursor.fetchall():
+            versions.append({
+                "version_id": row["version_id"],
+                "memory_id": row["memory_id"],
+                "content": row["content"],
+                "tags": json.loads(row["tags"]),
+                "metadata": json.loads(row["metadata"]),
+                "created_at": row["created_at"],
+            })
+
+        cursor.execute("SELECT id, name, tags, created_at FROM checkpoints")
+        checkpoints = []
+        for row in cursor.fetchall():
+            checkpoints.append({
+                "id": row["id"],
+                "name": row["name"],
+                "tags": json.loads(row["tags"]),
+                "created_at": row["created_at"],
+            })
+
+        conn.close()
+
+        return {
+            "version": 1,
+            "exported_at": time.time(),
+            "source_backend": "sqlite",
+            "memories": memories,
+            "memory_versions": versions,
+            "checkpoints": checkpoints,
+        }
+
+    def import_memories(self, data: Dict[str, Any]) -> Dict[str, int]:
+        """Import memories from an export dict. Skips duplicates by ID."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        counts = {"memories": 0, "memory_versions": 0, "checkpoints": 0}
+
+        for mem in data.get("memories", []):
+            cursor.execute("SELECT 1 FROM memories WHERE id = ?", (mem["id"],))
+            if cursor.fetchone():
+                continue
+            tags = json.dumps(mem.get("tags", []))
+            metadata = json.dumps(mem.get("metadata", {}))
+            cursor.execute(
+                "INSERT INTO memories (id, content, tags, metadata, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (mem["id"], mem["content"], tags, metadata,
+                 mem["created_at"], mem["updated_at"], mem.get("expires_at"))
+            )
+            counts["memories"] += 1
+
+            # Regenerate embeddings if vector store available
+            if self.vector_store:
+                try:
+                    self.vector_store.add_text(mem["id"], mem["content"], mem.get("metadata", {}))
+                except Exception:
+                    pass
+
+        for ver in data.get("memory_versions", []):
+            cursor.execute("SELECT 1 FROM memory_versions WHERE version_id = ?", (ver["version_id"],))
+            if cursor.fetchone():
+                continue
+            tags = json.dumps(ver.get("tags", []))
+            metadata = json.dumps(ver.get("metadata", {}))
+            cursor.execute(
+                "INSERT INTO memory_versions (version_id, memory_id, content, tags, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (ver["version_id"], ver["memory_id"], ver["content"], tags, metadata, ver["created_at"])
+            )
+            counts["memory_versions"] += 1
+
+        for chk in data.get("checkpoints", []):
+            cursor.execute("SELECT 1 FROM checkpoints WHERE id = ?", (chk["id"],))
+            if cursor.fetchone():
+                continue
+            tags = json.dumps(chk.get("tags", []))
+            cursor.execute(
+                "INSERT INTO checkpoints (id, name, tags, created_at) VALUES (?, ?, ?, ?)",
+                (chk["id"], chk["name"], tags, chk["created_at"])
+            )
+            counts["checkpoints"] += 1
+
+        conn.commit()
+        conn.close()
+        return counts
